@@ -1,6 +1,6 @@
 # FluidSim 3D
 
-FluidSim 3D is a macOS Raylib + Metal particle simulator with water tank, gas tank, wind tunnel, imported OBJ obstacles, acoustics controls, and the same dark control-panel feel carried into the 3D version.
+FluidSim 3D is a macOS Raylib + Metal particle simulator with water tank, gas tank, wind tunnel, imported OBJ obstacles and acoustics controls.
 
 ## Screenshots
 
