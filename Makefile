@@ -1,9 +1,9 @@
 CC := clang
 CXX := clang++
-TARGET := build/gassim
+TARGET := build/gassim3d
 
-C_SRC := src/main.c
-MM_SRC := src/imgui_panel.mm
+C_SRC := src/main_3d.c
+MM_SRC := src/imgui_panel_3d.mm
 CPP_SRC := \
 	third_party/rlImGui/rlImGui.cpp \
 	third_party/imgui/imgui.cpp \
@@ -12,8 +12,8 @@ CPP_SRC := \
 	third_party/imgui/imgui_widgets.cpp
 
 OBJS := \
-	build/main.o \
-	build/imgui_panel.o \
+	build/main_3d.o \
+	build/imgui_panel_3d.o \
 	build/rlImGui.o \
 	build/imgui.o \
 	build/imgui_draw.o \
@@ -27,9 +27,10 @@ INCLUDES := $(RAYLIB_CFLAGS) -Isrc -Ithird_party/imgui -Ithird_party/rlImGui -It
 CFLAGS := -std=c11 -x objective-c -fobjc-arc -O3 -ffast-math -fblocks -Wall -Wextra -Wpedantic $(INCLUDES)
 MMFLAGS := -std=c++17 -x objective-c++ -fobjc-arc -O3 -ffast-math -fblocks -Wall -Wextra -Wpedantic $(INCLUDES)
 THIRD_PARTY_CXXFLAGS := -std=c++17 -O3 -ffast-math -fblocks $(INCLUDES)
-LDFLAGS := $(RAYLIB_LIBS) -lm -framework Foundation -framework Metal
+CFLAGS_3D := $(CFLAGS)
+LDFLAGS := $(RAYLIB_LIBS) -lm -framework Foundation -framework AppKit -framework Metal
 
-.PHONY: all run clean
+.PHONY: all run run3d clean
 
 all: $(TARGET)
 
@@ -37,13 +38,9 @@ $(TARGET): $(OBJS)
 	mkdir -p build
 	$(CXX) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
-build/main.o: $(C_SRC)
+build/main_3d.o: $(C_SRC)
 	mkdir -p build
-	$(CC) $(CFLAGS) -c $< -o $@
-
-build/imgui_panel.o: $(MM_SRC)
-	mkdir -p build
-	$(CXX) $(MMFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS_3D) -c $< -o $@
 
 build/rlImGui.o: third_party/rlImGui/rlImGui.cpp
 	mkdir -p build
@@ -65,8 +62,14 @@ build/imgui_widgets.o: third_party/imgui/imgui_widgets.cpp
 	mkdir -p build
 	$(CXX) $(THIRD_PARTY_CXXFLAGS) -c $< -o $@
 
+build/imgui_panel_3d.o: $(MM_SRC)
+	mkdir -p build
+	$(CXX) $(MMFLAGS) -c $< -o $@
+
 run: $(TARGET)
 	./$(TARGET)
+
+run3d: run
 
 clean:
 	rm -rf build
