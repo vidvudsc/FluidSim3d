@@ -4,6 +4,9 @@ using namespace metal;
 
 #define CAR_SHAPE_SCALE_X 0.82f
 #define CAR_SHAPE_SCALE_Y 1.08f
+#define WATER_CYLINDER_MAX 16
+#define WATER_OBSTACLE_CYLINDERS 0u
+#define WATER_OBSTACLE_RECTANGLES 1u
 
 struct GpuSimParams3D {
     uint particleCount;
@@ -14,11 +17,23 @@ struct GpuSimParams3D {
     uint preset;
     uint scene;
     uint obstacleModel;
+    uint obstacleEnabled;
+    uint waterCylinderCount;
+    uint waterObstacleShape;
     uint interactionActive;
     uint acousticsEnabled;
     uint importedSdfWidth;
     uint importedSdfHeight;
     uint importedSdfDepth;
+    float waterCylinderX[WATER_CYLINDER_MAX];
+    float waterCylinderY[WATER_CYLINDER_MAX];
+    float waterCylinderZ[WATER_CYLINDER_MAX];
+    float waterCylinderRadius[WATER_CYLINDER_MAX];
+    float waterCylinderHalfDepth[WATER_CYLINDER_MAX];
+    float waterRectangleHalfWidth[WATER_CYLINDER_MAX];
+    float waterRectangleHalfHeight[WATER_CYLINDER_MAX];
+    float waterRectangleAngleCos[WATER_CYLINDER_MAX];
+    float waterRectangleAngleSin[WATER_CYLINDER_MAX];
     float boundsMinX;
     float boundsMinY;
     float boundsMinZ;
@@ -173,6 +188,11 @@ inline float hashNoise(uint x)
 inline bool sceneIsWindTunnel(constant GpuSimParams3D &params)
 {
     return params.scene == SCENE_WIND_TUNNEL;
+}
+
+inline bool solidObstacleActive(constant GpuSimParams3D &params)
+{
+    return params.obstacleEnabled != 0u;
 }
 
 inline bool acousticsActive(constant GpuSimParams3D &params)
@@ -400,6 +420,77 @@ inline float3 obstacleNormal(constant GpuSimParams3D &params, const device float
     float fallbackLen = length(fallback);
     if (fallbackLen > 1e-6f) {
         return fallback / fallbackLen;
+    }
+    return float3(1.0f, 0.0f, 0.0f);
+}
+
+inline float waterCylinderSignedDistance(constant GpuSimParams3D &params, float x, float y, float z)
+{
+    float minDistance = 1.0e6f;
+    const uint count = min(params.waterCylinderCount, (uint)WATER_CYLINDER_MAX);
+    for (uint i = 0u; i < count; ++i) {
+        float2 delta = float2(x - params.waterCylinderX[i], y - params.waterCylinderY[i]);
+        float radialDistance = length(delta) - params.waterCylinderRadius[i];
+        float distance = extrudedSignedDistance(radialDistance, z - params.waterCylinderZ[i],
+            params.waterCylinderHalfDepth[i]);
+        minDistance = min(minDistance, distance);
+    }
+    return minDistance;
+}
+
+inline float waterRectangleSignedDistance(constant GpuSimParams3D &params, float x, float y, float z)
+{
+    float minDistance = 1.0e6f;
+    const uint count = min(params.waterCylinderCount, (uint)WATER_CYLINDER_MAX);
+    for (uint i = 0u; i < count; ++i) {
+        float2 p = float2(x - params.waterCylinderX[i], y - params.waterCylinderY[i]);
+        float2 local = float2(
+            params.waterRectangleAngleCos[i] * p.x + params.waterRectangleAngleSin[i] * p.y,
+            -params.waterRectangleAngleSin[i] * p.x + params.waterRectangleAngleCos[i] * p.y);
+        float baseDistance = rectangleSignedDistance(local,
+            float2(params.waterRectangleHalfWidth[i], params.waterRectangleHalfHeight[i]));
+        float distance = extrudedSignedDistance(baseDistance, z - params.waterCylinderZ[i],
+            params.waterCylinderHalfDepth[i]);
+        minDistance = min(minDistance, distance);
+    }
+    return minDistance;
+}
+
+inline float solidObstacleSignedDistance(constant GpuSimParams3D &params,
+    const device float *importedSdf,
+    float x, float y, float z)
+{
+    if (sceneIsWindTunnel(params)) {
+        return obstacleSignedDistance(params, importedSdf, x, y, z);
+    }
+    if (params.waterCylinderCount > 0u && params.waterObstacleShape == WATER_OBSTACLE_RECTANGLES) {
+        return waterRectangleSignedDistance(params, x, y, z);
+    }
+    if (params.waterCylinderCount > 0u) {
+        return waterCylinderSignedDistance(params, x, y, z);
+    }
+    return 1.0e6f;
+}
+
+inline float3 solidObstacleNormal(constant GpuSimParams3D &params,
+    const device float *importedSdf,
+    float x, float y, float z)
+{
+    if (sceneIsWindTunnel(params)) {
+        return obstacleNormal(params, importedSdf, x, y, z);
+    }
+
+    float epsilon = max(params.particleRadius * 0.65f, 0.75f);
+    float dx = solidObstacleSignedDistance(params, importedSdf, x + epsilon, y, z) -
+        solidObstacleSignedDistance(params, importedSdf, x - epsilon, y, z);
+    float dy = solidObstacleSignedDistance(params, importedSdf, x, y + epsilon, z) -
+        solidObstacleSignedDistance(params, importedSdf, x, y - epsilon, z);
+    float dz = solidObstacleSignedDistance(params, importedSdf, x, y, z + epsilon) -
+        solidObstacleSignedDistance(params, importedSdf, x, y, z - epsilon);
+    float3 normal = float3(dx, dy, dz);
+    float len = length(normal);
+    if (len > 1e-6f) {
+        return normal / len;
     }
     return float3(1.0f, 0.0f, 0.0f);
 }
@@ -641,21 +732,23 @@ inline void addSceneForceContribution(constant GpuSimParams3D &params,
     float vx, float vy, float vz,
     thread float &ax, thread float &ay, thread float &az)
 {
-    if (!sceneIsWindTunnel(params)) {
+    if (sceneIsWindTunnel(params)) {
+        float profile = windTunnelProfile(params, y, z);
+        float xNorm = clampf((x - params.boundsMinX) / max(params.boundsSizeX, 1e-6f), 0.0f, 1.0f);
+        float driveBias = 1.18f - 0.22f * xNorm;
+        ax += params.flowDrive * profile * driveBias *
+            (1.0f - vx / max(params.flowTargetSpeed, 1e-4f));
+        ay -= params.flowDrive * 0.030f * vy;
+        az -= params.flowDrive * 0.030f * vz;
+    }
+
+    if (!solidObstacleActive(params)) {
         return;
     }
 
-    float profile = windTunnelProfile(params, y, z);
-    float xNorm = clampf((x - params.boundsMinX) / max(params.boundsSizeX, 1e-6f), 0.0f, 1.0f);
-    float driveBias = 1.18f - 0.22f * xNorm;
-    ax += params.flowDrive * profile * driveBias *
-        (1.0f - vx / max(params.flowTargetSpeed, 1e-4f));
-    ay -= params.flowDrive * 0.030f * vy;
-    az -= params.flowDrive * 0.030f * vz;
-
-    float signedDistance = obstacleSignedDistance(params, importedSdf, x, y, z);
+    float signedDistance = solidObstacleSignedDistance(params, importedSdf, x, y, z);
     if (signedDistance < params.obstacleShell) {
-        float3 normal = obstacleNormal(params, importedSdf, x, y, z);
+        float3 normal = solidObstacleNormal(params, importedSdf, x, y, z);
         float falloff = clampf(1.0f - signedDistance / params.obstacleShell, 0.0f, 1.8f);
         float repulse = params.obstacleStrength * falloff * falloff;
         float vn = dot(float3(vx, vy, vz), normal);
@@ -696,24 +789,25 @@ inline void resolveObstacle(constant GpuSimParams3D &params,
     thread float &x, thread float &y, thread float &z,
     thread float &vx, thread float &vy, thread float &vz)
 {
-    if (!sceneIsWindTunnel(params)) {
+    if (!solidObstacleActive(params)) {
         return;
     }
 
-    float surfaceOffset = params.particleRadius * ((params.obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f);
+    float surfaceOffset = params.particleRadius *
+        ((sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f);
     float3 normal = float3(1.0f, 0.0f, 0.0f);
     bool resolved = false;
 
-    uint maxIterations = (params.obstacleModel == OBSTACLE_CAR) ? 4u : 2u;
+    uint maxIterations = (sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 4u : 2u;
     for (uint iteration = 0u; iteration < maxIterations; ++iteration) {
-        float signedDistance = obstacleSignedDistance(params, importedSdf, x, y, z);
+        float signedDistance = solidObstacleSignedDistance(params, importedSdf, x, y, z);
         if (signedDistance >= surfaceOffset) {
             break;
         }
 
-        normal = obstacleNormal(params, importedSdf, x, y, z);
+        normal = solidObstacleNormal(params, importedSdf, x, y, z);
         float pushOut = (surfaceOffset - signedDistance) +
-            params.particleRadius * ((params.obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f);
+            params.particleRadius * ((sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f);
         x += normal.x * pushOut;
         y += normal.y * pushOut;
         z += normal.z * pushOut;

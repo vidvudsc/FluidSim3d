@@ -5,6 +5,7 @@
 
     #include <dispatch/dispatch.h>
     #include <ctype.h>
+    #include <errno.h>
     #include <float.h>
     #include <math.h>
     #include <stdbool.h>
@@ -13,12 +14,15 @@
     #include <stdlib.h>
     #include <string.h>
     #include <limits.h>
+    #include <sys/stat.h>
+    #include <time.h>
     #include <unistd.h>
 
     #if defined(__APPLE__)
     #import <AppKit/AppKit.h>
     #import <Foundation/Foundation.h>
     #import <Metal/Metal.h>
+    #include <mach-o/dyld.h>
     #endif
 
     #define WINDOW_WIDTH 1400
@@ -41,7 +45,7 @@
     #define PARTICLE_VIEW_FULL_DRAW_LIMIT 12000
     #define GPU_PARTICLE_VIEW_FULL_DRAW_LIMIT 24000
     #define SMOOTH_VIEW_FULL_DRAW_LIMIT 24000
-    #define GPU_SMOOTH_VIEW_FULL_DRAW_LIMIT MAX_PARTICLES_3D
+    #define GPU_SMOOTH_VIEW_FULL_DRAW_LIMIT 160000
     #define MIC_WAVEFORM_SAMPLES 192
     #define AUDIO_OUTPUT_SAMPLE_RATE 48000
     #define AUDIO_OUTPUT_BUFFER_FRAMES 4096
@@ -65,6 +69,24 @@
     #define IMPORTED_OBSTACLE_PATH_MAX 1024
     #define CAR_SHAPE_SCALE_X 0.82f
     #define CAR_SHAPE_SCALE_Y 1.08f
+    #define BAKE_DEFAULT_DURATION_SECONDS 5.0f
+    #define BAKE_MIN_DURATION_SECONDS 1.0f
+    #define BAKE_MAX_DURATION_SECONDS 60.0f
+    #define BAKE_DEFAULT_PARTICLE_COUNT 120000
+    #define BAKE_MAX_PARTICLE_COUNT 1000000
+    #define BAKE_PREVIEW_FPS 24
+    #define BAKE_PREVIEW_PARTICLE_CAP 200000
+    #define BAKE_KEYFRAME_INTERVAL_SECONDS 1.0f
+    #define BAKE_CHUNK_BUDGET_SECONDS 0.014
+    #define BAKE_MIC_EXPORT_SAMPLE_RATE 48000
+    #define BAKE_CACHE_VERSION 1
+    #define BAKE_PATH_MAX 1024
+    #define ACOUSTIC_AUDIO_PREROLL_SECONDS 1.0f
+    #define ACOUSTIC_AUDIO_POSTROLL_SECONDS 1.0f
+    #define ACOUSTIC_AUDIO_DRIVER_SAMPLE_RATE 24000.0f
+    #define ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE 4.0f
+    #define ACOUSTIC_AUDIO_BAKE_MIN_SUBSTEPS_PER_SAMPLE 16.0f
+    #define WATER_CYLINDER_MAX UI_3D_WATER_CYLINDER_MAX
 
     typedef enum MaterialPreset {
         MATERIAL_WATER = 0,
@@ -153,6 +175,10 @@
         float yaw;
         float pitch;
         float distance;
+        bool flyMode;
+        Vector3 flyPosition;
+        float flyYaw;
+        float flyPitch;
     } OrbitCameraState;
 
     typedef struct ParticleDrawItem {
@@ -165,6 +191,65 @@
         Vector3 trail[FLOW_PATHLINE_TRAIL_MAX];
         int count;
     } FlowPathline;
+
+    typedef enum BakeStatus3D {
+        BAKE_STATUS_IDLE = 0,
+        BAKE_STATUS_BAKING,
+        BAKE_STATUS_STOPPED,
+        BAKE_STATUS_COMPLETE,
+        BAKE_STATUS_PLAYBACK
+    } BakeStatus3D;
+
+    typedef struct BakePreviewParticle3D {
+        float x;
+        float y;
+        float z;
+        float vx;
+        float vy;
+        float vz;
+        float temperature;
+        float density;
+        float pressure;
+        float dye;
+        float vorticity;
+    } BakePreviewParticle3D;
+
+    typedef struct BakeMicSample3D {
+        float time;
+        float value;
+    } BakeMicSample3D;
+
+    typedef struct BakeSession3D {
+        BakeStatus3D status;
+        float duration;
+        int particleTarget;
+        float startSimulationTime;
+        float bakedTime;
+        float progress;
+        float playbackTime;
+        bool playbackPlaying;
+        bool hasCache;
+        bool canExportMic;
+        char cacheDir[BAKE_PATH_MAX];
+        char latestPath[BAKE_PATH_MAX];
+        char notice[256];
+        int previewFrameCount;
+        int keyframeCount;
+        int nextPreviewFrame;
+        int nextKeyframeIndex;
+        int previewParticleCount;
+        BakePreviewParticle3D *previewParticles;
+        int previewParticleCapacity;
+        int loadedPreviewFrame;
+        BakeMicSample3D *micSamples;
+        int micSampleCount;
+        int micSampleCapacity;
+        double lastChunkMs;
+        double wallStartTime;
+        float etaSeconds;
+        float lastBakedTimeForEta;
+        double lastEtaWallTime;
+    } BakeSession3D;
 
     typedef struct ImportedTriangle {
         Vector3 a;
@@ -182,8 +267,22 @@
         ViewMode viewMode;
         ColorMode colorMode;
         SimulationBackend activeBackend;
+        bool bakeCapacityMode;
         SimulationScene scene;
         ObstacleModel obstacleModel;
+        bool waterObstacleEnabled;
+        int waterObstacleShape;
+        bool waterCylindersInitialized;
+        int waterCylinderCount;
+        int waterCylinderSelected;
+        float waterCylinderX[WATER_CYLINDER_MAX];
+        float waterCylinderY[WATER_CYLINDER_MAX];
+        float waterCylinderZ[WATER_CYLINDER_MAX];
+        float waterCylinderRadius[WATER_CYLINDER_MAX];
+        float waterCylinderDepth[WATER_CYLINDER_MAX];
+        float waterRectangleWidth[WATER_CYLINDER_MAX];
+        float waterRectangleHeight[WATER_CYLINDER_MAX];
+        float waterRectangleAngleDegrees[WATER_CYLINDER_MAX];
         bool paused;
         bool gpuBackendAvailable;
         bool acousticsEnabled;
@@ -330,6 +429,16 @@
         float acousticMachLimit;
         float acousticViscosityScale;
         float acousticDragScale;
+        bool acousticAudioLoaded;
+        char acousticAudioPath[BAKE_PATH_MAX];
+        char acousticAudioLabel[128];
+        float *acousticEnvelope;
+        int acousticEnvelopeCount;
+        float acousticEnvelopeSampleRate;
+        float acousticEnvelopeDuration;
+        float *acousticWaveform;
+        int acousticWaveformCount;
+        float acousticWaveformSampleRate;
         bool audioOutputEnabled;
         bool audioOutputReady;
         AudioStream micAudioStream;
@@ -351,11 +460,23 @@
         uint32_t preset;
         uint32_t scene;
         uint32_t obstacleModel;
+        uint32_t obstacleEnabled;
+        uint32_t waterCylinderCount;
+        uint32_t waterObstacleShape;
         uint32_t interactionActive;
         uint32_t acousticsEnabled;
         uint32_t importedSdfWidth;
         uint32_t importedSdfHeight;
         uint32_t importedSdfDepth;
+        float waterCylinderX[WATER_CYLINDER_MAX];
+        float waterCylinderY[WATER_CYLINDER_MAX];
+        float waterCylinderZ[WATER_CYLINDER_MAX];
+        float waterCylinderRadius[WATER_CYLINDER_MAX];
+        float waterCylinderHalfDepth[WATER_CYLINDER_MAX];
+        float waterRectangleHalfWidth[WATER_CYLINDER_MAX];
+        float waterRectangleHalfHeight[WATER_CYLINDER_MAX];
+        float waterRectangleAngleCos[WATER_CYLINDER_MAX];
+        float waterRectangleAngleSin[WATER_CYLINDER_MAX];
         float boundsMinX;
         float boundsMinY;
         float boundsMinZ;
@@ -455,6 +576,16 @@
     static void BuildGrid(ParticleSystem3D *system);
     static void SetSimulationScene(ParticleSystem3D *system, SimulationScene scene);
     static void ResetSimulation(ParticleSystem3D *system, MaterialPreset preset);
+    static void BakeSessionInit(BakeSession3D *bake);
+    static void BakeSessionFree(BakeSession3D *bake);
+    static void BakeStart(ParticleSystem3D *system, BakeSession3D *bake);
+    static void BakeStop(BakeSession3D *bake);
+    static void BakeUpdate(ParticleSystem3D *system, BakeSession3D *bake);
+    static void BakePlaybackUpdate(ParticleSystem3D *system, BakeSession3D *bake, float frameDelta);
+    static bool BakeSetPlaybackTime(ParticleSystem3D *system, BakeSession3D *bake, float playbackTime);
+    static bool BakeLoadLatest(ParticleSystem3D *system, BakeSession3D *bake);
+    static bool BakeExportMicWav(BakeSession3D *bake);
+    static bool LoadAcousticAudioFile(ParticleSystem3D *system);
 
     static const MaterialParams MATERIAL_PRESETS[MATERIAL_COUNT] = {
         [MATERIAL_WATER] = {
@@ -627,6 +758,107 @@
         return system->scene == SCENE_WIND_TUNNEL;
     }
 
+    static bool SceneIsWaterTank(const ParticleSystem3D *system)
+    {
+        return system->scene == SCENE_TANK && system->preset == MATERIAL_WATER;
+    }
+
+    static bool WaterObstaclesActive(const ParticleSystem3D *system)
+    {
+        return SceneIsWaterTank(system) && system->waterObstacleEnabled && system->waterCylinderCount > 0;
+    }
+
+    static bool WaterCylindersActive(const ParticleSystem3D *system)
+    {
+        return WaterObstaclesActive(system) &&
+            system->waterObstacleShape == UI_3D_WATER_OBSTACLE_CYLINDERS;
+    }
+
+    static bool WaterRectanglesActive(const ParticleSystem3D *system)
+    {
+        return WaterObstaclesActive(system) &&
+            system->waterObstacleShape == UI_3D_WATER_OBSTACLE_RECTANGLES;
+    }
+
+    static bool SolidObstacleActive(const ParticleSystem3D *system)
+    {
+        return SceneIsWindTunnel(system) || WaterObstaclesActive(system);
+    }
+
+    static void SetDefaultWaterCylinderSlot(ParticleSystem3D *system, int index, int totalCount)
+    {
+        const float t = ((float)index + 0.5f) / fmaxf((float)totalCount, 1.0f);
+        const float stagger = ((index & 1) == 0) ? -0.07f : 0.07f;
+        system->waterCylinderX[index] = system->boundsMin.x + system->boundsSize.x * (0.40f + stagger);
+        system->waterCylinderY[index] = system->boundsMin.y + system->boundsSize.y * (0.15f + 0.54f * t);
+        system->waterCylinderZ[index] = system->boundsCenter.z;
+        system->waterCylinderRadius[index] = fmaxf(4.0f, fminf(system->boundsSize.x, system->boundsSize.y) * 0.060f);
+        system->waterCylinderDepth[index] = system->boundsSize.z * 0.92f;
+    }
+
+    static void SetDefaultWaterRectangleSlot(ParticleSystem3D *system, int index, int totalCount)
+    {
+        const float t = ((float)index + 0.5f) / fmaxf((float)totalCount, 1.0f);
+        const float stagger = ((index & 1) == 0) ? -0.08f : 0.08f;
+        system->waterCylinderX[index] = system->boundsMin.x + system->boundsSize.x * (0.43f + stagger);
+        system->waterCylinderY[index] = system->boundsMin.y + system->boundsSize.y * (0.18f + 0.50f * t);
+        system->waterCylinderZ[index] = system->boundsCenter.z;
+        system->waterCylinderDepth[index] = system->boundsSize.z * 0.88f;
+        system->waterRectangleWidth[index] = fmaxf(10.0f, system->boundsSize.x * 0.12f);
+        system->waterRectangleHeight[index] = fmaxf(12.0f, system->boundsSize.y * 0.18f);
+        system->waterRectangleAngleDegrees[index] = ((index & 1) == 0) ? -24.0f : 24.0f;
+    }
+
+    static void InitializeDefaultWaterCylinders(ParticleSystem3D *system)
+    {
+        if (system->waterCylindersInitialized) {
+            return;
+        }
+
+        system->waterCylinderCount = 4;
+        system->waterCylinderSelected = 0;
+        for (int i = 0; i < WATER_CYLINDER_MAX; ++i) {
+            SetDefaultWaterCylinderSlot(system, i, WATER_CYLINDER_MAX);
+            SetDefaultWaterRectangleSlot(system, i, WATER_CYLINDER_MAX);
+        }
+        system->waterCylindersInitialized = true;
+    }
+
+    static void ClampWaterCylinders(ParticleSystem3D *system)
+    {
+        system->waterObstacleShape = ClampInt(system->waterObstacleShape, 0, UI_3D_WATER_OBSTACLE_SHAPE_COUNT - 1);
+        system->waterCylinderCount = ClampInt(system->waterCylinderCount, 1, WATER_CYLINDER_MAX);
+        system->waterCylinderSelected = ClampInt(system->waterCylinderSelected, 0, system->waterCylinderCount - 1);
+
+        const float maxRadius = fmaxf(3.0f, fminf(system->boundsSize.x, system->boundsSize.y) * 0.24f);
+        const float maxDepth = fmaxf(8.0f, system->boundsSize.z);
+        const float maxRectWidth = fmaxf(5.0f, system->boundsSize.x * 0.72f);
+        const float maxRectHeight = fmaxf(5.0f, system->boundsSize.y * 0.72f);
+        for (int i = 0; i < WATER_CYLINDER_MAX; ++i) {
+            float radius = ClampFloat(system->waterCylinderRadius[i], 2.5f, maxRadius);
+            float depth = ClampFloat(system->waterCylinderDepth[i], 6.0f, maxDepth);
+            float rectWidth = ClampFloat(system->waterRectangleWidth[i], 5.0f, maxRectWidth);
+            float rectHeight = ClampFloat(system->waterRectangleHeight[i], 5.0f, maxRectHeight);
+            const float obstacleMargin = (system->waterObstacleShape == UI_3D_WATER_OBSTACLE_RECTANGLES)
+                ? 0.5f * sqrtf(rectWidth * rectWidth + rectHeight * rectHeight)
+                : radius;
+            const float xMargin = fminf(obstacleMargin + system->params.particleRadius, system->boundsSize.x * 0.45f);
+            const float yMargin = fminf(obstacleMargin + system->params.particleRadius, system->boundsSize.y * 0.45f);
+            const float zMargin = fminf(depth * 0.5f, system->boundsSize.z * 0.50f);
+            system->waterCylinderRadius[i] = radius;
+            system->waterCylinderDepth[i] = depth;
+            system->waterRectangleWidth[i] = rectWidth;
+            system->waterRectangleHeight[i] = rectHeight;
+            system->waterRectangleAngleDegrees[i] = ClampFloat(system->waterRectangleAngleDegrees[i], -180.0f, 180.0f);
+            system->waterCylinderX[i] = ClampFloat(system->waterCylinderX[i],
+                system->boundsMin.x + xMargin, system->boundsMax.x - xMargin);
+            system->waterCylinderY[i] = ClampFloat(system->waterCylinderY[i],
+                system->boundsMin.y + yMargin, system->boundsMax.y - yMargin);
+            system->waterCylinderZ[i] = ClampFloat(system->waterCylinderZ[i],
+                system->boundsMin.z + zMargin, system->boundsMax.z - zMargin);
+        }
+    }
+
     static bool AcousticsAvailable(const ParticleSystem3D *system)
     {
         return system->scene == SCENE_TANK && system->preset == MATERIAL_GAS;
@@ -686,6 +918,10 @@
 
     static int EffectiveTargetParticleCount(const ParticleSystem3D *system)
     {
+        if (system->bakeCapacityMode) {
+            return ClampInt(system->targetParticleCount, 1, system->maxParticles);
+        }
+
         return ClampInt(system->targetParticleCount,
             BackendMinTargetParticleCount(system->activeBackend),
             BackendMaxTargetParticleCount(system, system->activeBackend));
@@ -952,7 +1188,34 @@
             [panel setCanChooseFiles:YES];
             [panel setCanChooseDirectories:NO];
             [panel setAllowsMultipleSelection:NO];
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
             [panel setAllowedFileTypes:@[@"obj"]];
+    #pragma clang diagnostic pop
+            if ([panel runModal] == NSModalResponseOK && panel.URL.path != nil) {
+                snprintf(outPath, outPathSize, "%s", panel.URL.path.UTF8String);
+                return true;
+            }
+        }
+    #else
+        (void)outPath;
+        (void)outPathSize;
+    #endif
+        return false;
+    }
+
+    static bool OpenAudioFileDialog(char *outPath, size_t outPathSize)
+    {
+    #if defined(__APPLE__)
+        @autoreleasepool {
+            NSOpenPanel *panel = [NSOpenPanel openPanel];
+            [panel setCanChooseFiles:YES];
+            [panel setCanChooseDirectories:NO];
+            [panel setAllowsMultipleSelection:NO];
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [panel setAllowedFileTypes:@[@"wav", @"mp3"]];
+    #pragma clang diagnostic pop
             if ([panel runModal] == NSModalResponseOK && panel.URL.path != nil) {
                 snprintf(outPath, outPathSize, "%s", panel.URL.path.UTF8String);
                 return true;
@@ -1195,6 +1458,49 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return sqrtf(outsideX * outsideX + outsideY * outsideY) + fminf(fmaxf(baseDistance, dz), 0.0f);
     }
 
+    static float WaterCylinderSignedDistance(const ParticleSystem3D *system, float x, float y, float z)
+    {
+        if (!WaterCylindersActive(system)) {
+            return 1e6f;
+        }
+
+        float minDistance = 1e6f;
+        const int count = ClampInt(system->waterCylinderCount, 0, WATER_CYLINDER_MAX);
+        for (int i = 0; i < count; ++i) {
+            const float dx = x - system->waterCylinderX[i];
+            const float dy = y - system->waterCylinderY[i];
+            const float radialDistance = sqrtf(dx * dx + dy * dy) - system->waterCylinderRadius[i];
+            const float distance = ExtrudeSignedDistance(radialDistance,
+                z - system->waterCylinderZ[i], system->waterCylinderDepth[i] * 0.5f);
+            minDistance = fminf(minDistance, distance);
+        }
+        return minDistance;
+    }
+
+    static float WaterRectangleSignedDistance(const ParticleSystem3D *system, float x, float y, float z)
+    {
+        if (!WaterRectanglesActive(system)) {
+            return 1e6f;
+        }
+
+        float minDistance = 1e6f;
+        const int count = ClampInt(system->waterCylinderCount, 0, WATER_CYLINDER_MAX);
+        for (int i = 0; i < count; ++i) {
+            const Vector2 local = RotateVector((Vector2){
+                x - system->waterCylinderX[i],
+                y - system->waterCylinderY[i],
+            }, -system->waterRectangleAngleDegrees[i] * DEG2RAD);
+            const float baseDistance = RectangleSignedDistance(local, (Vector2){
+                system->waterRectangleWidth[i] * 0.5f,
+                system->waterRectangleHeight[i] * 0.5f,
+            });
+            const float distance = ExtrudeSignedDistance(baseDistance,
+                z - system->waterCylinderZ[i], system->waterCylinderDepth[i] * 0.5f);
+            minDistance = fminf(minDistance, distance);
+        }
+        return minDistance;
+    }
+
     static float ObstacleSignedDistanceLocal(const ParticleSystem3D *system, Vector3 p)
     {
         float baseDistance = 0.0f;
@@ -1251,6 +1557,53 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return (Vector3){1.0f, 0.0f, 0.0f};
     }
 
+    static float SolidObstacleSignedDistance(const ParticleSystem3D *system, float x, float y, float z)
+    {
+        if (SceneIsWindTunnel(system)) {
+            return ObstacleSignedDistance(system, x, y, z);
+        }
+        if (WaterCylindersActive(system)) {
+            return WaterCylinderSignedDistance(system, x, y, z);
+        }
+        if (WaterRectanglesActive(system)) {
+            return WaterRectangleSignedDistance(system, x, y, z);
+        }
+        return 1e6f;
+    }
+
+    static Vector3 SolidObstacleNormal(const ParticleSystem3D *system, float x, float y, float z)
+    {
+        if (SceneIsWindTunnel(system)) {
+            return ObstacleNormal(system, x, y, z);
+        }
+
+        const float epsilon = fmaxf(system->params.particleRadius * 0.65f, 0.75f);
+        const float dx = SolidObstacleSignedDistance(system, x + epsilon, y, z) -
+            SolidObstacleSignedDistance(system, x - epsilon, y, z);
+        const float dy = SolidObstacleSignedDistance(system, x, y + epsilon, z) -
+            SolidObstacleSignedDistance(system, x, y - epsilon, z);
+        const float dz = SolidObstacleSignedDistance(system, x, y, z + epsilon) -
+            SolidObstacleSignedDistance(system, x, y, z - epsilon);
+        const Vector3 normal = {dx, dy, dz};
+        const float length = Vector3Length(normal);
+        if (length > 1e-6f) {
+            return Vector3Scale(normal, 1.0f / length);
+        }
+
+        const int selectedMax = (system->waterCylinderCount > 0) ? system->waterCylinderCount - 1 : 0;
+        const int selected = ClampInt(system->waterCylinderSelected, 0, selectedMax);
+        const Vector3 fallback = {
+            x - system->waterCylinderX[selected],
+            y - system->waterCylinderY[selected],
+            z - system->waterCylinderZ[selected],
+        };
+        const float fallbackLength = Vector3Length(fallback);
+        if (fallbackLength > 1e-6f) {
+            return Vector3Scale(fallback, 1.0f / fallbackLength);
+        }
+        return (Vector3){1.0f, 0.0f, 0.0f};
+    }
+
     static float WindTunnelAxisProfile(float value, float minValue, float maxValue)
     {
         const float t = ClampFloat(RangeLerp(minValue, maxValue, value), 0.0f, 1.0f);
@@ -1294,6 +1647,62 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return fminf(system->speakerAmplitude, cappedAmplitude);
     }
 
+    static float AcousticEnvelopeMultiplier(const ParticleSystem3D *system)
+    {
+        if (!system->acousticAudioLoaded || system->acousticEnvelope == NULL ||
+            system->acousticEnvelopeCount <= 1 || system->acousticEnvelopeSampleRate <= 0.0f) {
+            return 1.0f;
+        }
+
+        const float samplePosition = (system->simulationTime - ACOUSTIC_AUDIO_PREROLL_SECONDS) *
+            system->acousticEnvelopeSampleRate;
+        if (samplePosition < 0.0f || samplePosition >= (float)(system->acousticEnvelopeCount - 1)) {
+            return 0.0f;
+        }
+
+        const int i0 = (int)floorf(samplePosition);
+        const int i1 = i0 + 1;
+        const float t = samplePosition - (float)i0;
+        const float a = system->acousticEnvelope[i0];
+        const float b = system->acousticEnvelope[i1];
+        return ClampFloat(a + (b - a) * t, 0.0f, 1.0f);
+    }
+
+    static float AcousticWaveformSample(const ParticleSystem3D *system, float time)
+    {
+        if (!system->acousticAudioLoaded || system->acousticWaveform == NULL ||
+            system->acousticWaveformCount <= 1 || system->acousticWaveformSampleRate <= 0.0f) {
+            return 0.0f;
+        }
+
+        const float samplePosition = (time - ACOUSTIC_AUDIO_PREROLL_SECONDS) * system->acousticWaveformSampleRate;
+        if (samplePosition < 0.0f || samplePosition >= (float)(system->acousticWaveformCount - 1)) {
+            return 0.0f;
+        }
+
+        const int i0 = (int)floorf(samplePosition);
+        const int i1 = i0 + 1;
+        const float t = samplePosition - (float)i0;
+        const float a = system->acousticWaveform[i0];
+        const float b = system->acousticWaveform[i1];
+        return ClampFloat(a + (b - a) * t, -1.0f, 1.0f);
+    }
+
+    static float AcousticVisualWaveformSample(const ParticleSystem3D *system, float time)
+    {
+        if (!system->acousticAudioLoaded || system->acousticWaveformSampleRate <= 0.0f) {
+            return 0.0f;
+        }
+
+        const float smoothingWindow = fmaxf(1.0f / system->acousticWaveformSampleRate, 1.0f / 240.0f);
+        const float a = AcousticWaveformSample(system, time - smoothingWindow);
+        const float b = AcousticWaveformSample(system, time - smoothingWindow * 0.5f);
+        const float c = AcousticWaveformSample(system, time);
+        const float d = AcousticWaveformSample(system, time + smoothingWindow * 0.5f);
+        const float e = AcousticWaveformSample(system, time + smoothingWindow);
+        return ClampFloat((a + b * 2.0f + c * 3.0f + d * 2.0f + e) / 9.0f, -1.0f, 1.0f);
+    }
+
     static void ClampAcousticAnchors(ParticleSystem3D *system)
     {
         const float padding = system->params.particleRadius * 2.0f;
@@ -1324,11 +1733,29 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
     static void GetSpeakerState(const ParticleSystem3D *system, Vector3 *center, Vector3 *velocity, Vector3 *halfSize)
     {
+        const bool visualOnly = (velocity == NULL);
         const float phase = system->simulationTime * system->speakerFrequency * 2.0f * PI_F;
         const float amplitude = EffectiveSpeakerAmplitude(system);
-        const float displacement = amplitude * sinf(phase);
         const float angularFrequency = system->speakerFrequency * 2.0f * PI_F;
-        const float speed = amplitude * angularFrequency * cosf(phase);
+        float displacement = amplitude * AcousticEnvelopeMultiplier(system) * sinf(phase);
+        float speed = amplitude * angularFrequency * cosf(phase);
+        if (system->acousticAudioLoaded && system->acousticWaveform != NULL && system->acousticWaveformCount > 1) {
+            const float driverDt = 1.0f / fmaxf(system->acousticWaveformSampleRate, 1.0f);
+            const float previous = visualOnly
+                ? AcousticVisualWaveformSample(system, system->simulationTime - driverDt)
+                : AcousticWaveformSample(system, system->simulationTime - driverDt);
+            const float current = visualOnly
+                ? AcousticVisualWaveformSample(system, system->simulationTime)
+                : AcousticWaveformSample(system, system->simulationTime);
+            const float next = visualOnly
+                ? AcousticVisualWaveformSample(system, system->simulationTime + driverDt)
+                : AcousticWaveformSample(system, system->simulationTime + driverDt);
+            displacement = amplitude * current;
+            speed = amplitude * (next - previous) / (2.0f * driverDt);
+            const float maxSurfaceSpeed = ClampFloat(system->acousticMachLimit, 0.05f, 1.25f) *
+                fmaxf(EffectiveAcousticSoundSpeed(system), 1e-4f);
+            speed = ClampFloat(speed, -maxSurfaceSpeed, maxSurfaceSpeed);
+        }
         if (center != NULL) {
             *center = (Vector3){
                 system->speakerBaseCenter.x + displacement,
@@ -1446,7 +1873,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
 
         ParticleSystem3D *system = gAudioOutputSystem3D;
-        if (system == NULL || !system->audioOutputReady || !system->audioOutputEnabled || !AcousticsActive(system)) {
+        if (system == NULL || !system->audioOutputReady || !system->audioOutputEnabled ||
+            system->paused || !AcousticsActive(system)) {
             memset(samples, 0, (size_t)frames * sizeof(float));
             return;
         }
@@ -2152,6 +2580,137 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return false;
     }
 
+    static void ClearAcousticAudio(ParticleSystem3D *system)
+    {
+        if (system->acousticEnvelope != NULL) {
+            MemFree(system->acousticEnvelope);
+            system->acousticEnvelope = NULL;
+        }
+        if (system->acousticWaveform != NULL) {
+            MemFree(system->acousticWaveform);
+            system->acousticWaveform = NULL;
+        }
+        system->acousticEnvelopeCount = 0;
+        system->acousticEnvelopeSampleRate = 0.0f;
+        system->acousticEnvelopeDuration = 0.0f;
+        system->acousticWaveformCount = 0;
+        system->acousticWaveformSampleRate = 0.0f;
+        system->acousticAudioLoaded = false;
+        system->acousticAudioPath[0] = '\0';
+        snprintf(system->acousticAudioLabel, sizeof(system->acousticAudioLabel), "%s", "procedural");
+    }
+
+    static bool LoadAcousticAudioPath(ParticleSystem3D *system, const char *path)
+    {
+        if (path == NULL || path[0] == '\0') {
+            return false;
+        }
+
+        Wave wave = LoadWave(path);
+        if (!IsWaveValid(wave) || wave.frameCount <= 0) {
+            if (IsWaveValid(wave)) {
+                UnloadWave(wave);
+            }
+            SetBackendNotice(system, "Audio import failed.");
+            return false;
+        }
+
+        WaveFormat(&wave, BAKE_MIC_EXPORT_SAMPLE_RATE, 32, 1);
+        float *samples = LoadWaveSamples(wave);
+        if (samples == NULL) {
+            UnloadWave(wave);
+            SetBackendNotice(system, "Audio sample decode failed.");
+            return false;
+        }
+
+        const float envelopeRate = 1000.0f;
+        const int envelopeCount = ClampInt((int)ceilf((float)wave.frameCount / (float)wave.sampleRate * envelopeRate) + 2, 2, 600000);
+        float *envelope = (float *)MemAlloc((size_t)envelopeCount * sizeof(float));
+        if (envelope == NULL) {
+            UnloadWaveSamples(samples);
+            UnloadWave(wave);
+            SetBackendNotice(system, "Audio envelope allocation failed.");
+            return false;
+        }
+
+        const float waveformRate = ACOUSTIC_AUDIO_DRIVER_SAMPLE_RATE;
+        const int waveformCount = ClampInt((int)ceilf((float)wave.frameCount / (float)wave.sampleRate * waveformRate) + 2, 2, 5000000);
+        float *waveform = (float *)MemAlloc((size_t)waveformCount * sizeof(float));
+        if (waveform == NULL) {
+            MemFree(envelope);
+            UnloadWaveSamples(samples);
+            UnloadWave(wave);
+            SetBackendNotice(system, "Audio waveform allocation failed.");
+            return false;
+        }
+
+        const int framesPerEnvelopeSample = ClampInt((int)floorf((float)wave.sampleRate / envelopeRate), 1, wave.sampleRate);
+        float peak = 1e-6f;
+        for (int i = 0; i < envelopeCount; ++i) {
+            const int frameStart = i * framesPerEnvelopeSample;
+            const int frameEnd = ClampInt(frameStart + framesPerEnvelopeSample, frameStart, (int)wave.frameCount);
+            float sum = 0.0f;
+            int count = 0;
+            for (int frame = frameStart; frame < frameEnd; ++frame) {
+                sum += fabsf(samples[frame]);
+                ++count;
+            }
+            const float value = (count > 0) ? (sum / (float)count) : 0.0f;
+            envelope[i] = value;
+            peak = fmaxf(peak, value);
+        }
+
+        for (int i = 0; i < envelopeCount; ++i) {
+            envelope[i] = ClampFloat(envelope[i] / peak, 0.0f, 1.0f);
+        }
+
+        float waveformPeak = 1e-6f;
+        for (int i = 0; i < waveformCount; ++i) {
+            const float sourcePosition = (float)i / waveformRate * (float)wave.sampleRate;
+            const int i0 = ClampInt((int)floorf(sourcePosition), 0, (int)wave.frameCount - 1);
+            const int i1 = ClampInt(i0 + 1, 0, (int)wave.frameCount - 1);
+            const float t = sourcePosition - (float)i0;
+            const float value = samples[i0] + (samples[i1] - samples[i0]) * t;
+            waveform[i] = value;
+            waveformPeak = fmaxf(waveformPeak, fabsf(value));
+        }
+
+        for (int i = 0; i < waveformCount; ++i) {
+            waveform[i] = ClampFloat(waveform[i] / waveformPeak, -1.0f, 1.0f);
+        }
+
+        ClearAcousticAudio(system);
+        system->acousticEnvelope = envelope;
+        system->acousticEnvelopeCount = envelopeCount;
+        system->acousticEnvelopeSampleRate = envelopeRate;
+        system->acousticEnvelopeDuration = (float)wave.frameCount / (float)wave.sampleRate;
+        system->acousticWaveform = waveform;
+        system->acousticWaveformCount = waveformCount;
+        system->acousticWaveformSampleRate = waveformRate;
+        system->acousticAudioLoaded = true;
+        system->acousticsEnabled = true;
+        snprintf(system->acousticAudioPath, sizeof(system->acousticAudioPath), "%s", path);
+        snprintf(system->acousticAudioLabel, sizeof(system->acousticAudioLabel), "%s", GetFileName(path));
+        UnloadWaveSamples(samples);
+        UnloadWave(wave);
+        if (AcousticsAvailable(system)) {
+            ClampAcousticAnchors(system);
+            ResetSimulation(system, system->preset);
+        }
+        SetBackendNotice(system, "Loaded audio waveform for gas acoustics.");
+        return true;
+    }
+
+    static bool LoadAcousticAudioFile(ParticleSystem3D *system)
+    {
+        char path[BAKE_PATH_MAX];
+        if (!OpenAudioFileDialog(path, sizeof(path))) {
+            return false;
+        }
+
+        return LoadAcousticAudioPath(system, path);
+    }
+
     static void ConfigureSceneParameters(ParticleSystem3D *system)
     {
         system->obstacleCenter = system->boundsCenter;
@@ -2162,6 +2721,13 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->obstacleDamping = 0.0f;
         system->flowTargetSpeed = 0.0f;
         system->flowDrive = 0.0f;
+
+        if (WaterObstaclesActive(system)) {
+            system->obstacleShell = system->params.supportRadius * 1.55f;
+            system->obstacleStrength = system->params.soundSpeed * system->params.soundSpeed * 1.32f;
+            system->obstacleDamping = system->params.soundSpeed * 0.74f / fmaxf(system->params.supportRadius, 1.0f);
+            return;
+        }
 
         if (!SceneIsWindTunnel(system)) {
             return;
@@ -2346,6 +2912,10 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->activeBackend = SIM_BACKEND_CPU;
         system->scene = SCENE_TANK;
         system->obstacleModel = OBSTACLE_CIRCLE;
+        system->waterObstacleEnabled = false;
+        system->waterObstacleShape = UI_3D_WATER_OBSTACLE_CYLINDERS;
+        system->waterCylinderCount = 4;
+        system->waterCylinderSelected = 0;
         system->obstacleAngleDegrees = 0.0f;
         system->obstacleRectWidth = RECT_WIDTH_MIN_3D;
         system->obstacleRectHeight = RECT_HEIGHT_MIN_3D;
@@ -2430,6 +3000,79 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             fprintf(stderr, "Failed to allocate 3D simulation buffers\n");
             exit(EXIT_FAILURE);
         }
+    }
+
+    static bool ResizeSystemCapacity(ParticleSystem3D *system, int maxParticles)
+    {
+        if (maxParticles <= system->maxParticles) {
+            return true;
+        }
+
+        ShutdownGpuBackend(system);
+        const size_t particleBytes = (size_t)maxParticles * sizeof(float);
+        const size_t particleIntBytes = (size_t)maxParticles * sizeof(int);
+        const size_t drawBytes = (size_t)maxParticles * sizeof(ParticleDrawItem);
+
+    #define RESIZE_FLOAT_BUFFER(name) \
+        do { \
+            float *nextBuffer = (float *)MemRealloc(system->name, particleBytes); \
+            if (nextBuffer == NULL) { \
+                return false; \
+            } \
+            system->name = nextBuffer; \
+        } while (0)
+
+    #define RESIZE_INT_BUFFER(name) \
+        do { \
+            int *nextBuffer = (int *)MemRealloc(system->name, particleIntBytes); \
+            if (nextBuffer == NULL) { \
+                return false; \
+            } \
+            system->name = nextBuffer; \
+        } while (0)
+
+        RESIZE_FLOAT_BUFFER(x);
+        RESIZE_FLOAT_BUFFER(y);
+        RESIZE_FLOAT_BUFFER(z);
+        RESIZE_FLOAT_BUFFER(vx);
+        RESIZE_FLOAT_BUFFER(vy);
+        RESIZE_FLOAT_BUFFER(vz);
+        RESIZE_FLOAT_BUFFER(ax);
+        RESIZE_FLOAT_BUFFER(ay);
+        RESIZE_FLOAT_BUFFER(az);
+        RESIZE_FLOAT_BUFFER(density);
+        RESIZE_FLOAT_BUFFER(pressure);
+        RESIZE_FLOAT_BUFFER(temperature);
+        RESIZE_FLOAT_BUFFER(temperatureRate);
+        RESIZE_FLOAT_BUFFER(dye);
+        RESIZE_FLOAT_BUFFER(vorticity);
+        RESIZE_FLOAT_BUFFER(xsphVX);
+        RESIZE_FLOAT_BUFFER(xsphVY);
+        RESIZE_FLOAT_BUFFER(xsphVZ);
+        RESIZE_FLOAT_BUFFER(sortedX);
+        RESIZE_FLOAT_BUFFER(sortedY);
+        RESIZE_FLOAT_BUFFER(sortedZ);
+        RESIZE_FLOAT_BUFFER(sortedVX);
+        RESIZE_FLOAT_BUFFER(sortedVY);
+        RESIZE_FLOAT_BUFFER(sortedVZ);
+        RESIZE_FLOAT_BUFFER(sortedTemperature);
+        RESIZE_FLOAT_BUFFER(sortedDensity);
+        RESIZE_FLOAT_BUFFER(sortedPressure);
+        RESIZE_INT_BUFFER(particleCells);
+        RESIZE_INT_BUFFER(sortedCellIndices);
+        RESIZE_INT_BUFFER(sortedIndices);
+
+        ParticleDrawItem *nextDrawItems = (ParticleDrawItem *)MemRealloc(system->drawItems, drawBytes);
+        if (nextDrawItems == NULL) {
+            return false;
+        }
+        system->drawItems = nextDrawItems;
+        system->maxParticles = maxParticles;
+
+    #undef RESIZE_FLOAT_BUFFER
+    #undef RESIZE_INT_BUFFER
+
+        return true;
     }
 
     static void RebuildGrid(ParticleSystem3D *system)
@@ -2678,21 +3321,23 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         float vx, float vy, float vz,
         float *ax, float *ay, float *az)
     {
-        if (!SceneIsWindTunnel(system)) {
+        if (SceneIsWindTunnel(system)) {
+            const float profile = WindTunnelProfile(system, y, z);
+            const float xNorm = ClampFloat(RangeLerp(system->boundsMin.x, system->boundsMax.x, x), 0.0f, 1.0f);
+            const float driveBias = 1.18f - 0.22f * xNorm;
+            *ax += system->flowDrive * profile * driveBias *
+                (1.0f - vx / fmaxf(system->flowTargetSpeed, 1e-4f));
+            *ay -= system->flowDrive * 0.030f * vy;
+            *az -= system->flowDrive * 0.030f * vz;
+        }
+
+        if (!SolidObstacleActive(system)) {
             return;
         }
 
-        const float profile = WindTunnelProfile(system, y, z);
-        const float xNorm = ClampFloat(RangeLerp(system->boundsMin.x, system->boundsMax.x, x), 0.0f, 1.0f);
-        const float driveBias = 1.18f - 0.22f * xNorm;
-        *ax += system->flowDrive * profile * driveBias *
-            (1.0f - vx / fmaxf(system->flowTargetSpeed, 1e-4f));
-        *ay -= system->flowDrive * 0.030f * vy;
-        *az -= system->flowDrive * 0.030f * vz;
-
-        const float signedDistance = ObstacleSignedDistance(system, x, y, z);
+        const float signedDistance = SolidObstacleSignedDistance(system, x, y, z);
         if (signedDistance < system->obstacleShell) {
-            const Vector3 normal = ObstacleNormal(system, x, y, z);
+            const Vector3 normal = SolidObstacleNormal(system, x, y, z);
             const float falloff = ClampFloat(1.0f - signedDistance / system->obstacleShell, 0.0f, 1.8f);
             const float repulse = system->obstacleStrength * falloff * falloff;
             const float vn = vx * normal.x + vy * normal.y + vz * normal.z;
@@ -2734,25 +3379,25 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
     static void ResolveObstacle(ParticleSystem3D *system, int index)
     {
-        if (!SceneIsWindTunnel(system)) {
+        if (!SolidObstacleActive(system)) {
             return;
         }
 
         const float surfaceOffset = system->params.particleRadius *
-            ((system->obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f);
+            ((SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f);
         Vector3 normal = {1.0f, 0.0f, 0.0f};
         bool resolved = false;
 
-        const int maxIterations = (system->obstacleModel == OBSTACLE_CAR) ? 4 : 2;
+        const int maxIterations = (SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 4 : 2;
         for (int iteration = 0; iteration < maxIterations; ++iteration) {
-            const float signedDistance = ObstacleSignedDistance(system, system->x[index], system->y[index], system->z[index]);
+            const float signedDistance = SolidObstacleSignedDistance(system, system->x[index], system->y[index], system->z[index]);
             if (signedDistance >= surfaceOffset) {
                 break;
             }
 
-            normal = ObstacleNormal(system, system->x[index], system->y[index], system->z[index]);
+            normal = SolidObstacleNormal(system, system->x[index], system->y[index], system->z[index]);
             const float pushOut = (surfaceOffset - signedDistance) +
-                system->params.particleRadius * ((system->obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f);
+                system->params.particleRadius * ((SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f);
             system->x[index] += normal.x * pushOut;
             system->y[index] += normal.y * pushOut;
             system->z[index] += normal.z * pushOut;
@@ -2813,6 +3458,9 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
     static void SetObstacleModel(ParticleSystem3D *system, ObstacleModel obstacleModel)
     {
+        if (!SceneIsWindTunnel(system) && obstacleModel == OBSTACLE_IMPORTED) {
+            obstacleModel = OBSTACLE_CIRCLE;
+        }
         if (system->obstacleModel == obstacleModel) {
             return;
         }
@@ -2820,7 +3468,131 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->obstacleModel = obstacleModel;
         if (SceneIsWindTunnel(system)) {
             ResetSimulation(system, MATERIAL_GAS);
+        } else if (SceneIsWaterTank(system) && system->waterObstacleEnabled) {
+            ResetSimulation(system, MATERIAL_WATER);
         }
+    }
+
+    static void SetWaterObstacleEnabled(ParticleSystem3D *system, bool enabled)
+    {
+        if (system->waterObstacleEnabled == enabled) {
+            return;
+        }
+        system->waterObstacleEnabled = enabled;
+        InitializeDefaultWaterCylinders(system);
+        ClampWaterCylinders(system);
+        if (SceneIsWaterTank(system)) {
+            ResetSimulation(system, MATERIAL_WATER);
+        } else {
+            ConfigureSceneParameters(system);
+            InvalidateGpuBackendState(system);
+        }
+    }
+
+    static void SetWaterObstacleShape(ParticleSystem3D *system, int shape)
+    {
+        InitializeDefaultWaterCylinders(system);
+        const int clampedShape = ClampInt(shape, 0, UI_3D_WATER_OBSTACLE_SHAPE_COUNT - 1);
+        if (system->waterObstacleShape == clampedShape) {
+            return;
+        }
+        system->waterObstacleShape = clampedShape;
+        ClampWaterCylinders(system);
+        ConfigureSceneParameters(system);
+        InvalidateGpuBackendState(system);
+    }
+
+    static void SetWaterCylinderCount(ParticleSystem3D *system, int count)
+    {
+        InitializeDefaultWaterCylinders(system);
+        const int oldCount = system->waterCylinderCount;
+        system->waterCylinderCount = ClampInt(count, 1, WATER_CYLINDER_MAX);
+        for (int i = oldCount; i < system->waterCylinderCount; ++i) {
+            if (system->waterObstacleShape == UI_3D_WATER_OBSTACLE_RECTANGLES) {
+                SetDefaultWaterRectangleSlot(system, i, system->waterCylinderCount);
+            } else {
+                SetDefaultWaterCylinderSlot(system, i, system->waterCylinderCount);
+            }
+        }
+        ClampWaterCylinders(system);
+        ConfigureSceneParameters(system);
+        InvalidateGpuBackendState(system);
+    }
+
+    static void SetWaterCylinderSelected(ParticleSystem3D *system, int selected)
+    {
+        InitializeDefaultWaterCylinders(system);
+        system->waterCylinderSelected = ClampInt(selected, 0, system->waterCylinderCount - 1);
+    }
+
+    static void SetSelectedWaterCylinderPosition(ParticleSystem3D *system, int axis, float value)
+    {
+        InitializeDefaultWaterCylinders(system);
+        ClampWaterCylinders(system);
+        const int index = ClampInt(system->waterCylinderSelected, 0, system->waterCylinderCount - 1);
+        if (axis == 0) {
+            system->waterCylinderX[index] = value;
+        } else if (axis == 1) {
+            system->waterCylinderY[index] = value;
+        } else {
+            system->waterCylinderZ[index] = value;
+        }
+        ClampWaterCylinders(system);
+        InvalidateGpuBackendState(system);
+    }
+
+    static void SetSelectedWaterCylinderRadius(ParticleSystem3D *system, float radius)
+    {
+        InitializeDefaultWaterCylinders(system);
+        ClampWaterCylinders(system);
+        const int index = ClampInt(system->waterCylinderSelected, 0, system->waterCylinderCount - 1);
+        system->waterCylinderRadius[index] = radius;
+        ClampWaterCylinders(system);
+        ConfigureSceneParameters(system);
+        InvalidateGpuBackendState(system);
+    }
+
+    static void SetSelectedWaterCylinderDepth(ParticleSystem3D *system, float depth)
+    {
+        InitializeDefaultWaterCylinders(system);
+        ClampWaterCylinders(system);
+        const int index = ClampInt(system->waterCylinderSelected, 0, system->waterCylinderCount - 1);
+        system->waterCylinderDepth[index] = depth;
+        ClampWaterCylinders(system);
+        ConfigureSceneParameters(system);
+        InvalidateGpuBackendState(system);
+    }
+
+    static void SetSelectedWaterRectangleWidth(ParticleSystem3D *system, float width)
+    {
+        InitializeDefaultWaterCylinders(system);
+        ClampWaterCylinders(system);
+        const int index = ClampInt(system->waterCylinderSelected, 0, system->waterCylinderCount - 1);
+        system->waterRectangleWidth[index] = width;
+        ClampWaterCylinders(system);
+        ConfigureSceneParameters(system);
+        InvalidateGpuBackendState(system);
+    }
+
+    static void SetSelectedWaterRectangleHeight(ParticleSystem3D *system, float height)
+    {
+        InitializeDefaultWaterCylinders(system);
+        ClampWaterCylinders(system);
+        const int index = ClampInt(system->waterCylinderSelected, 0, system->waterCylinderCount - 1);
+        system->waterRectangleHeight[index] = height;
+        ClampWaterCylinders(system);
+        ConfigureSceneParameters(system);
+        InvalidateGpuBackendState(system);
+    }
+
+    static void SetSelectedWaterRectangleAngle(ParticleSystem3D *system, float angleDegrees)
+    {
+        InitializeDefaultWaterCylinders(system);
+        ClampWaterCylinders(system);
+        const int index = ClampInt(system->waterCylinderSelected, 0, system->waterCylinderCount - 1);
+        system->waterRectangleAngleDegrees[index] = ClampFloat(angleDegrees, -180.0f, 180.0f);
+        ClampWaterCylinders(system);
+        InvalidateGpuBackendState(system);
     }
 
     static void CycleObstacleModel(ParticleSystem3D *system)
@@ -2977,6 +3749,9 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         if (system->preset == MATERIAL_GAS || system->particleCount <= 0) {
             return;
         }
+        if (system->bakeCapacityMode && system->particleCount > 200000) {
+            return;
+        }
 
         double densitySum = 0.0;
         for (int slot = 0; slot < system->particleCount; ++slot) {
@@ -3008,6 +3783,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->boundsMax = (Vector3){75.0f, 82.0f, 44.0f};
         system->boundsSize = Vector3Subtract(system->boundsMax, system->boundsMin);
         system->boundsCenter = Vector3Scale(Vector3Add(system->boundsMin, system->boundsMax), 0.5f);
+        InitializeDefaultWaterCylinders(system);
         system->paused = false;
         system->accumulator = 0.0f;
         system->interactionActive = false;
@@ -3054,16 +3830,26 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         };
         const int targetParticles = EffectiveTargetParticleCount(system);
         const float targetSpacing = cbrtf((fillSize.x * fillSize.y * fillSize.z) / (float)targetParticles);
-        const float resolutionScale = ClampFloat((targetSpacing * 0.96f) / system->params.spacing, 0.30f, 1.75f);
+        const float minResolutionScale = system->bakeCapacityMode ? 0.06f :
+            ((system->activeBackend == SIM_BACKEND_GPU) ? 0.12f : 0.30f);
+        const float resolutionScale = ClampFloat((targetSpacing * 0.96f) / system->params.spacing, minResolutionScale, 1.75f);
 
         system->params.spacing *= resolutionScale;
         system->params.supportRadius *= resolutionScale;
-        system->params.particleRadius = fmaxf(0.60f, system->params.particleRadius * resolutionScale);
-        system->params.timeStep = fmaxf(1.0f / 720.0f, system->params.timeStep * fmaxf(resolutionScale, 0.45f));
+        const float minParticleRadius = system->bakeCapacityMode ? 0.18f :
+            ((system->activeBackend == SIM_BACKEND_GPU) ? 0.28f : 0.60f);
+        system->params.particleRadius = fmaxf(minParticleRadius,
+            system->params.particleRadius * resolutionScale);
+        const float minTimeStep = system->bakeCapacityMode ? (1.0f / 1440.0f) :
+            ((system->activeBackend == SIM_BACKEND_GPU) ? (1.0f / 960.0f) : (1.0f / 720.0f));
+        const float minTimeScale = system->bakeCapacityMode ? 0.18f :
+            ((system->activeBackend == SIM_BACKEND_GPU) ? 0.22f : 0.45f);
+        system->params.timeStep = fmaxf(minTimeStep, system->params.timeStep * fmaxf(resolutionScale, minTimeScale));
         system->baseSoundSpeed = system->params.soundSpeed;
         system->baseKinematicViscosity = system->params.kinematicViscosity;
         system->baseGlobalDrag = system->params.globalDrag;
 
+        ClampWaterCylinders(system);
         RefreshDerivedSimulationParameters(system);
         if (!system->acousticHandlesInitialized) {
             system->speakerBaseCenter = (Vector3){
@@ -3074,7 +3860,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             system->micPosition = (Vector3){
                 system->boundsMin.x + system->boundsSize.x * 0.78f,
                 system->boundsMin.y + system->boundsSize.y * 0.50f,
-                system->boundsCenter.z + system->boundsSize.z * 0.18f,
+                system->boundsCenter.z,
             };
             system->acousticHandlesInitialized = true;
         }
@@ -3101,8 +3887,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                     const float particleZ = origin.z + (float)z * spacing +
                         (HashNoise(seedIndex * 3 + 47) - 0.5f) * spacing * jitterScale;
 
-                    if (SceneIsWindTunnel(system) &&
-                        ObstacleSignedDistance(system, particleX, particleY, particleZ) < system->params.particleRadius * 1.2f) {
+                    if (SolidObstacleActive(system) &&
+                        SolidObstacleSignedDistance(system, particleX, particleY, particleZ) < system->params.particleRadius * 1.2f) {
                         continue;
                     }
                     if (AcousticsActive(system) &&
@@ -3448,7 +4234,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 pathline->current.x > system->boundsMax.x - system->params.particleRadius ||
                 pathline->current.y < system->boundsMin.y || pathline->current.y > system->boundsMax.y ||
                 pathline->current.z < system->boundsMin.z || pathline->current.z > system->boundsMax.z;
-            if (outsideBounds || ObstacleSignedDistance(system, pathline->current.x, pathline->current.y, pathline->current.z) < 0.0f) {
+            if (outsideBounds || (SolidObstacleActive(system) &&
+                    SolidObstacleSignedDistance(system, pathline->current.x, pathline->current.y, pathline->current.z) < 0.0f)) {
                 RespawnPathline(system, i);
                 continue;
             }
@@ -3882,7 +4669,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         if (AcousticsActive(system)) {
             GetSpeakerState(system, &speakerCenter, &speakerVelocity, &speakerHalfSize);
         }
-        return (GpuSimParams3D){
+        GpuSimParams3D params = (GpuSimParams3D){
             .particleCount = (uint32_t)system->particleCount,
             .gridWidth = (uint32_t)system->gridWidth,
             .gridHeight = (uint32_t)system->gridHeight,
@@ -3891,6 +4678,9 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             .preset = (uint32_t)system->preset,
             .scene = (uint32_t)system->scene,
             .obstacleModel = (uint32_t)system->obstacleModel,
+            .obstacleEnabled = SolidObstacleActive(system) ? 1u : 0u,
+            .waterCylinderCount = WaterObstaclesActive(system) ? (uint32_t)system->waterCylinderCount : 0u,
+            .waterObstacleShape = (uint32_t)system->waterObstacleShape,
             .interactionActive = system->interactionActive ? 1u : 0u,
             .acousticsEnabled = AcousticsActive(system) ? 1u : 0u,
             .importedSdfWidth = (uint32_t)system->importedSdfWidth,
@@ -3975,6 +4765,21 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             .simulationTime = system->simulationTime,
             .substepDt = dt,
         };
+
+        const int waterCount = WaterObstaclesActive(system) ? ClampInt(system->waterCylinderCount, 0, WATER_CYLINDER_MAX) : 0;
+        for (int i = 0; i < WATER_CYLINDER_MAX; ++i) {
+            params.waterCylinderX[i] = system->waterCylinderX[i];
+            params.waterCylinderY[i] = system->waterCylinderY[i];
+            params.waterCylinderZ[i] = system->waterCylinderZ[i];
+            params.waterCylinderRadius[i] = system->waterCylinderRadius[i];
+            params.waterCylinderHalfDepth[i] = system->waterCylinderDepth[i] * 0.5f;
+            params.waterRectangleHalfWidth[i] = system->waterRectangleWidth[i] * 0.5f;
+            params.waterRectangleHalfHeight[i] = system->waterRectangleHeight[i] * 0.5f;
+            params.waterRectangleAngleCos[i] = cosf(system->waterRectangleAngleDegrees[i] * DEG2RAD);
+            params.waterRectangleAngleSin[i] = sinf(system->waterRectangleAngleDegrees[i] * DEG2RAD);
+        }
+        params.waterCylinderCount = (uint32_t)waterCount;
+        return params;
     }
 
     @implementation MetalGpuBackend3D {
@@ -4720,12 +5525,800 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
     }
 
+    static void BakeSetNotice(BakeSession3D *bake, const char *message)
+    {
+        if (message == NULL) {
+            bake->notice[0] = '\0';
+            return;
+        }
+        snprintf(bake->notice, sizeof(bake->notice), "%s", message);
+    }
+
+    static bool EnsureDirectoryExists(const char *path)
+    {
+        if (path == NULL || path[0] == '\0') {
+            return false;
+        }
+        if (mkdir(path, 0755) == 0) {
+            return true;
+        }
+        return errno == EEXIST;
+    }
+
+    static char gProjectRootPath[BAKE_PATH_MAX] = {0};
+
+    static void StripTrailingSlash(char *path)
+    {
+        if (path == NULL) {
+            return;
+        }
+        size_t length = strlen(path);
+        while (length > 1 && path[length - 1] == '/') {
+            path[length - 1] = '\0';
+            --length;
+        }
+    }
+
+    static void ParentDirectoryInPlace(char *path)
+    {
+        if (path == NULL || path[0] == '\0') {
+            return;
+        }
+        StripTrailingSlash(path);
+        char *slash = strrchr(path, '/');
+        if (slash == NULL) {
+            snprintf(path, BAKE_PATH_MAX, "%s", ".");
+        } else if (slash == path) {
+            slash[1] = '\0';
+        } else {
+            *slash = '\0';
+        }
+    }
+
+    static bool DirectoryLooksLikeProjectRoot(const char *path)
+    {
+        char marker[BAKE_PATH_MAX];
+        snprintf(marker, sizeof(marker), "%s/src/main_3d.c", path);
+        if (FileExists(marker)) {
+            return true;
+        }
+        snprintf(marker, sizeof(marker), "%s/Makefile", path);
+        return FileExists(marker);
+    }
+
+    static bool FindProjectRootFromDirectory(const char *startPath, char *outPath, size_t outPathSize)
+    {
+        if (startPath == NULL || startPath[0] == '\0') {
+            return false;
+        }
+
+        char candidate[BAKE_PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s", startPath);
+        StripTrailingSlash(candidate);
+
+        for (int depth = 0; depth < 8; ++depth) {
+            if (DirectoryLooksLikeProjectRoot(candidate)) {
+                snprintf(outPath, outPathSize, "%s", candidate);
+                return true;
+            }
+            char previous[BAKE_PATH_MAX];
+            snprintf(previous, sizeof(previous), "%s", candidate);
+            ParentDirectoryInPlace(candidate);
+            if (strcmp(previous, candidate) == 0) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    static const char *ProjectRootPath(void)
+    {
+        if (gProjectRootPath[0] != '\0') {
+            return gProjectRootPath;
+        }
+
+    #if defined(__APPLE__)
+        char executablePath[BAKE_PATH_MAX];
+        uint32_t executablePathSize = (uint32_t)sizeof(executablePath);
+        if (_NSGetExecutablePath(executablePath, &executablePathSize) == 0) {
+            char resolvedPath[BAKE_PATH_MAX];
+            const char *pathForDirectory = executablePath;
+            if (realpath(executablePath, resolvedPath) != NULL) {
+                pathForDirectory = resolvedPath;
+            }
+            char executableDirectory[BAKE_PATH_MAX];
+            snprintf(executableDirectory, sizeof(executableDirectory), "%s", pathForDirectory);
+            ParentDirectoryInPlace(executableDirectory);
+            if (FindProjectRootFromDirectory(executableDirectory, gProjectRootPath, sizeof(gProjectRootPath))) {
+                return gProjectRootPath;
+            }
+        }
+    #endif
+
+        const char *appDirectory = GetApplicationDirectory();
+        if (appDirectory != NULL && appDirectory[0] != '\0' &&
+            FindProjectRootFromDirectory(appDirectory, gProjectRootPath, sizeof(gProjectRootPath))) {
+            return gProjectRootPath;
+        }
+
+        char currentDirectory[BAKE_PATH_MAX];
+        if (getcwd(currentDirectory, sizeof(currentDirectory)) != NULL &&
+            FindProjectRootFromDirectory(currentDirectory, gProjectRootPath, sizeof(gProjectRootPath))) {
+            return gProjectRootPath;
+        }
+
+        snprintf(gProjectRootPath, sizeof(gProjectRootPath), "%s", ".");
+        return gProjectRootPath;
+    }
+
+    static void MakeProjectPath(const char *relativePath, char *outPath, size_t outPathSize)
+    {
+        if (relativePath == NULL || relativePath[0] == '\0') {
+            snprintf(outPath, outPathSize, "%s", ProjectRootPath());
+            return;
+        }
+        if (relativePath[0] == '/') {
+            snprintf(outPath, outPathSize, "%s", relativePath);
+            return;
+        }
+        snprintf(outPath, outPathSize, "%s/%s", ProjectRootPath(), relativePath);
+    }
+
+    static const char *BakeSceneName(const ParticleSystem3D *system)
+    {
+        if (SceneIsWindTunnel(system)) {
+            return "wind";
+        }
+        return (system->preset == MATERIAL_GAS) ? "gas" : "water";
+    }
+
+    static void BakeMakeCachePath(BakeSession3D *bake, const ParticleSystem3D *system)
+    {
+        char bakesDirectory[BAKE_PATH_MAX];
+        MakeProjectPath("bakes", bakesDirectory, sizeof(bakesDirectory));
+        EnsureDirectoryExists(bakesDirectory);
+
+        time_t rawTime = time(NULL);
+        struct tm localTime;
+        localtime_r(&rawTime, &localTime);
+        char stamp[64];
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H%M%S", &localTime);
+
+        snprintf(bake->cacheDir, sizeof(bake->cacheDir), "%s/%s_%s", bakesDirectory, BakeSceneName(system), stamp);
+        for (int suffix = 1; suffix < 100; ++suffix) {
+            if (EnsureDirectoryExists(bake->cacheDir)) {
+                break;
+            }
+            snprintf(bake->cacheDir, sizeof(bake->cacheDir), "%s/%s_%s_%02d",
+                bakesDirectory, BakeSceneName(system), stamp, suffix);
+        }
+        snprintf(bake->latestPath, sizeof(bake->latestPath), "%s/latest.txt", bakesDirectory);
+    }
+
+    static void BakeSessionInit(BakeSession3D *bake)
+    {
+        memset(bake, 0, sizeof(*bake));
+        bake->status = BAKE_STATUS_IDLE;
+        bake->duration = BAKE_DEFAULT_DURATION_SECONDS;
+        bake->particleTarget = BAKE_DEFAULT_PARTICLE_COUNT;
+        bake->loadedPreviewFrame = -1;
+        bake->etaSeconds = 0.0f;
+        bake->lastBakedTimeForEta = 0.0f;
+        bake->lastEtaWallTime = 0.0;
+        BakeSetNotice(bake, "Bake mode is idle.");
+    }
+
+    static void BakeSessionFree(BakeSession3D *bake)
+    {
+        if (bake->previewParticles != NULL) {
+            MemFree(bake->previewParticles);
+            bake->previewParticles = NULL;
+        }
+        if (bake->micSamples != NULL) {
+            MemFree(bake->micSamples);
+            bake->micSamples = NULL;
+        }
+        bake->previewParticleCapacity = 0;
+        bake->micSampleCapacity = 0;
+    }
+
+    static bool BakeEnsurePreviewCapacity(BakeSession3D *bake, int count)
+    {
+        if (count <= bake->previewParticleCapacity) {
+            return true;
+        }
+
+        BakePreviewParticle3D *next =
+            (BakePreviewParticle3D *)MemRealloc(bake->previewParticles, (size_t)count * sizeof(BakePreviewParticle3D));
+        if (next == NULL) {
+            return false;
+        }
+        bake->previewParticles = next;
+        bake->previewParticleCapacity = count;
+        return true;
+    }
+
+    static bool BakeAppendMicSample(BakeSession3D *bake, float time, float value)
+    {
+        if (bake->micSampleCount >= bake->micSampleCapacity) {
+            const int nextCapacity = (bake->micSampleCapacity > 0) ? bake->micSampleCapacity * 2 : 4096;
+            BakeMicSample3D *next =
+                (BakeMicSample3D *)MemRealloc(bake->micSamples, (size_t)nextCapacity * sizeof(BakeMicSample3D));
+            if (next == NULL) {
+                return false;
+            }
+            bake->micSamples = next;
+            bake->micSampleCapacity = nextCapacity;
+        }
+
+        bake->micSamples[bake->micSampleCount++] = (BakeMicSample3D){
+            .time = time,
+            .value = value,
+        };
+        bake->canExportMic = true;
+        return true;
+    }
+
+    static bool BakeWriteManifest(const ParticleSystem3D *system, const BakeSession3D *bake)
+    {
+        char path[BAKE_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/manifest.txt", bake->cacheDir);
+        FILE *file = fopen(path, "wb");
+        if (file == NULL) {
+            return false;
+        }
+
+        fprintf(file, "version=%d\n", BAKE_CACHE_VERSION);
+        fprintf(file, "scene=%s\n", BakeSceneName(system));
+        fprintf(file, "duration=%.6f\n", bake->duration);
+        fprintf(file, "baked_time=%.6f\n", bake->bakedTime);
+        fprintf(file, "particle_target=%d\n", bake->particleTarget);
+        fprintf(file, "preview_fps=%d\n", BAKE_PREVIEW_FPS);
+        fprintf(file, "preview_cap=%d\n", BAKE_PREVIEW_PARTICLE_CAP);
+        fprintf(file, "preview_frames=%d\n", bake->previewFrameCount);
+        fprintf(file, "keyframes=%d\n", bake->keyframeCount);
+        fprintf(file, "keyframe_interval=%.6f\n", BAKE_KEYFRAME_INTERVAL_SECONDS);
+        fprintf(file, "color_mode=%d\n", system->colorMode);
+        fprintf(file, "view_mode=%d\n", system->viewMode);
+        fprintf(file, "acoustics_enabled=%d\n", system->acousticsEnabled ? 1 : 0);
+        fprintf(file, "audio_path=%s\n", system->acousticAudioLoaded ? system->acousticAudioPath : "");
+        fprintf(file, "audio_duration=%.6f\n", system->acousticAudioLoaded ? system->acousticEnvelopeDuration : 0.0f);
+        fprintf(file, "audio_driver_rate=%.6f\n", system->acousticAudioLoaded ? system->acousticWaveformSampleRate : 0.0f);
+        fprintf(file, "audio_driver_substeps=%.6f\n", ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE);
+        fprintf(file, "audio_preroll=%.6f\n", ACOUSTIC_AUDIO_PREROLL_SECONDS);
+        fprintf(file, "audio_postroll=%.6f\n", ACOUSTIC_AUDIO_POSTROLL_SECONDS);
+        fprintf(file, "imported_obj=%s\n", system->importedObstacleLoaded ? system->importedObstaclePath : "");
+        fclose(file);
+
+        FILE *latest = fopen(bake->latestPath, "wb");
+        if (latest != NULL) {
+            fprintf(latest, "%s\n", bake->cacheDir);
+            fclose(latest);
+        }
+        return true;
+    }
+
+    static bool BakeWritePreviewFrame(const ParticleSystem3D *system, BakeSession3D *bake, int frameIndex)
+    {
+        const int particleCount = system->particleCount;
+        const int previewCount = ClampInt(particleCount, 0, BAKE_PREVIEW_PARTICLE_CAP);
+        if (previewCount <= 0 || !BakeEnsurePreviewCapacity(bake, previewCount)) {
+            return false;
+        }
+
+        const int stride = fmaxf(1.0f, ceilf((float)particleCount / (float)previewCount));
+        for (int i = 0; i < previewCount; ++i) {
+            const int source = ClampInt(i * stride, 0, particleCount - 1);
+            bake->previewParticles[i] = (BakePreviewParticle3D){
+                .x = system->x[source],
+                .y = system->y[source],
+                .z = system->z[source],
+                .vx = system->vx[source],
+                .vy = system->vy[source],
+                .vz = system->vz[source],
+                .temperature = system->temperature[source],
+                .density = system->density[source],
+                .pressure = system->pressure[source],
+                .dye = system->dye[source],
+                .vorticity = system->vorticity[source],
+            };
+        }
+
+        char path[BAKE_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/preview_%05d.bin", bake->cacheDir, frameIndex);
+        FILE *file = fopen(path, "wb");
+        if (file == NULL) {
+            return false;
+        }
+
+        const uint32_t magic = 0x56505346u;
+        const uint32_t version = BAKE_CACHE_VERSION;
+        const float time = (float)frameIndex / (float)BAKE_PREVIEW_FPS;
+        fwrite(&magic, sizeof(magic), 1, file);
+        fwrite(&version, sizeof(version), 1, file);
+        fwrite(&previewCount, sizeof(previewCount), 1, file);
+        fwrite(&time, sizeof(time), 1, file);
+        fwrite(bake->previewParticles, sizeof(BakePreviewParticle3D), (size_t)previewCount, file);
+        fclose(file);
+
+        bake->previewParticleCount = previewCount;
+        bake->previewFrameCount = fmaxf(bake->previewFrameCount, frameIndex + 1);
+        bake->loadedPreviewFrame = frameIndex;
+        bake->hasCache = true;
+        return true;
+    }
+
+    static bool BakeWriteKeyframe(const ParticleSystem3D *system, BakeSession3D *bake, int keyframeIndex)
+    {
+        char path[BAKE_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/key_%04d.bin", bake->cacheDir, keyframeIndex);
+        FILE *file = fopen(path, "wb");
+        if (file == NULL) {
+            return false;
+        }
+
+        const uint32_t magic = 0x59454b46u;
+        const uint32_t version = BAKE_CACHE_VERSION;
+        const int count = system->particleCount;
+        fwrite(&magic, sizeof(magic), 1, file);
+        fwrite(&version, sizeof(version), 1, file);
+        fwrite(&count, sizeof(count), 1, file);
+        fwrite(&system->simulationTime, sizeof(system->simulationTime), 1, file);
+        fwrite(system->x, sizeof(float), (size_t)count, file);
+        fwrite(system->y, sizeof(float), (size_t)count, file);
+        fwrite(system->z, sizeof(float), (size_t)count, file);
+        fwrite(system->vx, sizeof(float), (size_t)count, file);
+        fwrite(system->vy, sizeof(float), (size_t)count, file);
+        fwrite(system->vz, sizeof(float), (size_t)count, file);
+        fwrite(system->temperature, sizeof(float), (size_t)count, file);
+        fwrite(system->dye, sizeof(float), (size_t)count, file);
+        fclose(file);
+
+        bake->keyframeCount = fmaxf(bake->keyframeCount, keyframeIndex + 1);
+        return true;
+    }
+
+    static bool BakeLoadPreviewFrame(ParticleSystem3D *system, BakeSession3D *bake, int frameIndex)
+    {
+        if (frameIndex < 0 || frameIndex >= bake->previewFrameCount) {
+            return false;
+        }
+        if (frameIndex == bake->loadedPreviewFrame && bake->previewParticleCount > 0) {
+            return true;
+        }
+
+        char path[BAKE_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/preview_%05d.bin", bake->cacheDir, frameIndex);
+        FILE *file = fopen(path, "rb");
+        if (file == NULL) {
+            BakeSetNotice(bake, "Preview frame missing from cache.");
+            return false;
+        }
+
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        int count = 0;
+        float time = 0.0f;
+        fread(&magic, sizeof(magic), 1, file);
+        fread(&version, sizeof(version), 1, file);
+        fread(&count, sizeof(count), 1, file);
+        fread(&time, sizeof(time), 1, file);
+        if (magic != 0x56505346u || version != BAKE_CACHE_VERSION || count <= 0) {
+            fclose(file);
+            BakeSetNotice(bake, "Preview cache version mismatch.");
+            return false;
+        }
+        if (count > system->maxParticles && !ResizeSystemCapacity(system, count)) {
+            fclose(file);
+            BakeSetNotice(bake, "Preview particle buffer allocation failed.");
+            return false;
+        }
+
+        if (!BakeEnsurePreviewCapacity(bake, count)) {
+            fclose(file);
+            BakeSetNotice(bake, "Preview allocation failed.");
+            return false;
+        }
+
+        const size_t readCount = fread(bake->previewParticles, sizeof(BakePreviewParticle3D), (size_t)count, file);
+        fclose(file);
+        if (readCount != (size_t)count) {
+            BakeSetNotice(bake, "Preview frame read failed.");
+            return false;
+        }
+
+        for (int i = 0; i < count; ++i) {
+            const BakePreviewParticle3D p = bake->previewParticles[i];
+            system->x[i] = p.x;
+            system->y[i] = p.y;
+            system->z[i] = p.z;
+            system->vx[i] = p.vx;
+            system->vy[i] = p.vy;
+            system->vz[i] = p.vz;
+            system->density[i] = p.density;
+            system->pressure[i] = p.pressure;
+            system->temperature[i] = p.temperature;
+            system->dye[i] = p.dye;
+            system->vorticity[i] = p.vorticity;
+        }
+        system->particleCount = count;
+        system->scalarFieldsDirty = true;
+        system->sortedStateDirty = true;
+        system->vorticityDirty = true;
+        bake->previewParticleCount = count;
+        bake->loadedPreviewFrame = frameIndex;
+        return true;
+    }
+
+    static float BakeSampleMicTimeline(const BakeSession3D *bake, float time)
+    {
+        if (bake->micSampleCount <= 0 || bake->micSamples == NULL) {
+            return 0.0f;
+        }
+        if (time <= bake->micSamples[0].time) {
+            return bake->micSamples[0].value;
+        }
+        int hi = 1;
+        while (hi < bake->micSampleCount && bake->micSamples[hi].time < time) {
+            ++hi;
+        }
+        if (hi >= bake->micSampleCount) {
+            return bake->micSamples[bake->micSampleCount - 1].value;
+        }
+        const BakeMicSample3D a = bake->micSamples[hi - 1];
+        const BakeMicSample3D b = bake->micSamples[hi];
+        const float span = fmaxf(b.time - a.time, 1e-6f);
+        const float t = ClampFloat((time - a.time) / span, 0.0f, 1.0f);
+        return a.value + (b.value - a.value) * t;
+    }
+
+    static bool BakeExportMicWav(BakeSession3D *bake)
+    {
+        if (!bake->canExportMic || bake->micSampleCount <= 1) {
+            BakeSetNotice(bake, "No bake mic signal to export yet.");
+            return false;
+        }
+
+        char path[BAKE_PATH_MAX];
+        char exportDirectory[BAKE_PATH_MAX];
+        MakeProjectPath("export_sound", exportDirectory, sizeof(exportDirectory));
+        if (!EnsureDirectoryExists(exportDirectory)) {
+            BakeSetNotice(bake, "Could not create export_sound folder.");
+            return false;
+        }
+        time_t rawTime = time(NULL);
+        struct tm localTime;
+        localtime_r(&rawTime, &localTime);
+        char stamp[64];
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H%M%S", &localTime);
+        snprintf(path, sizeof(path), "%s/mic_export_%s.wav", exportDirectory, stamp);
+        const int frameCount = ClampInt((int)ceilf(fmaxf(bake->bakedTime, 0.05f) * (float)BAKE_MIC_EXPORT_SAMPLE_RATE),
+            1, INT_MAX / (int)sizeof(short));
+        short *pcm = (short *)MemAlloc((size_t)frameCount * sizeof(short));
+        if (pcm == NULL) {
+            BakeSetNotice(bake, "Mic WAV allocation failed.");
+            return false;
+        }
+
+        for (int i = 0; i < frameCount; ++i) {
+            const float t = (float)i / (float)BAKE_MIC_EXPORT_SAMPLE_RATE;
+            const float value = ClampFloat(BakeSampleMicTimeline(bake, t), -1.0f, 1.0f);
+            pcm[i] = (short)lrintf(value * 32767.0f);
+        }
+
+        Wave wave = {
+            .frameCount = (unsigned int)frameCount,
+            .sampleRate = BAKE_MIC_EXPORT_SAMPLE_RATE,
+            .sampleSize = 16,
+            .channels = 1,
+            .data = pcm,
+        };
+        const bool ok = ExportWave(wave, path);
+        MemFree(pcm);
+        if (ok) {
+            snprintf(bake->notice, sizeof(bake->notice), "Exported %s", path);
+        } else {
+            BakeSetNotice(bake, "Mic WAV export failed.");
+        }
+        return ok;
+    }
+
+    static bool BakeGpuStepOnce(ParticleSystem3D *system)
+    {
+        float dt = system->params.timeStep;
+        if (AcousticsActive(system)) {
+            const float h = system->params.supportRadius;
+            const float speakerSpeed = SpeakerPeakSurfaceSpeed(system);
+            const float speakerWaveDt = 0.20f * h / fmaxf(system->params.soundSpeed + speakerSpeed, 1e-4f);
+            const float speakerPhaseDt = 1.0f / fmaxf(system->speakerFrequency * 24.0f, 1e-4f);
+            float acousticDt = fminf(speakerWaveDt, speakerPhaseDt);
+            const bool audioDriverActive = system->acousticAudioLoaded &&
+                system->acousticWaveformSampleRate > 0.0f &&
+                system->simulationTime >= ACOUSTIC_AUDIO_PREROLL_SECONDS;
+            if (system->acousticAudioLoaded && !audioDriverActive) {
+                acousticDt = fminf(acousticDt,
+                    fmaxf(ACOUSTIC_AUDIO_PREROLL_SECONDS - system->simulationTime, 1e-6f));
+            }
+            if (audioDriverActive) {
+                acousticDt = fminf(acousticDt,
+                    1.0f / (system->acousticWaveformSampleRate * ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE));
+            }
+            const float minDt = audioDriverActive
+                ? (1.0f / (system->acousticWaveformSampleRate * ACOUSTIC_AUDIO_BAKE_MIN_SUBSTEPS_PER_SAMPLE))
+                : (system->params.timeStep * 0.05f);
+            dt = ClampFloat(fminf(dt, acousticDt), minDt, system->params.timeStep);
+        }
+
+        system->lastStepDt = dt;
+        if (!RunGpuStep(system, dt)) {
+            return false;
+        }
+
+        SampleMicrophone(system);
+        system->simulationTime += dt;
+        system->scalarFieldsDirty = true;
+        system->sortedStateDirty = true;
+        system->vorticityDirty = true;
+        return true;
+    }
+
+    static void BakeStart(ParticleSystem3D *system, BakeSession3D *bake)
+    {
+        if (system->acousticAudioLoaded) {
+            if (!AcousticsAvailable(system)) {
+                system->scene = SCENE_TANK;
+                system->tankPreset = MATERIAL_GAS;
+                system->preset = MATERIAL_GAS;
+            }
+            system->acousticsEnabled = true;
+        }
+        float requestedDuration = ClampFloat(bake->duration, BAKE_MIN_DURATION_SECONDS, BAKE_MAX_DURATION_SECONDS);
+        if (AcousticsAvailable(system) && system->acousticAudioLoaded && system->acousticEnvelopeDuration > 0.0f) {
+            requestedDuration = fmaxf(BAKE_MIN_DURATION_SECONDS,
+                system->acousticEnvelopeDuration + ACOUSTIC_AUDIO_PREROLL_SECONDS + ACOUSTIC_AUDIO_POSTROLL_SECONDS);
+        }
+        const int requestedTarget = ClampInt(bake->particleTarget, 1, BAKE_MAX_PARTICLE_COUNT);
+        BakeSessionFree(bake);
+        BakeSessionInit(bake);
+        bake->duration = requestedDuration;
+        bake->particleTarget = requestedTarget;
+
+        if (!ResizeSystemCapacity(system, requestedTarget)) {
+            bake->status = BAKE_STATUS_STOPPED;
+            BakeSetNotice(bake, "Bake particle buffer allocation failed.");
+            return;
+        }
+
+        if (!InitializeGpuBackend(system)) {
+            bake->status = BAKE_STATUS_STOPPED;
+            BakeSetNotice(bake, "Bake requires Metal GPU initialization; bake not started.");
+            return;
+        }
+
+        BakeMakeCachePath(bake, system);
+        if (!EnsureDirectoryExists(bake->cacheDir)) {
+            bake->status = BAKE_STATUS_STOPPED;
+            BakeSetNotice(bake, "Could not create bake cache directory.");
+            return;
+        }
+
+        system->activeBackend = SIM_BACKEND_GPU;
+        system->bakeCapacityMode = true;
+        system->targetParticleCount = requestedTarget;
+        system->paused = false;
+        system->accumulator = 0.0f;
+        ResetSimulation(system, system->preset);
+
+        bake->status = BAKE_STATUS_BAKING;
+        bake->startSimulationTime = system->simulationTime;
+        bake->bakedTime = 0.0f;
+        bake->progress = 0.0f;
+        bake->playbackTime = 0.0f;
+        bake->playbackPlaying = false;
+        bake->wallStartTime = GetTime();
+        bake->etaSeconds = 0.0f;
+        bake->lastBakedTimeForEta = 0.0f;
+        bake->lastEtaWallTime = bake->wallStartTime;
+        bake->nextPreviewFrame = 1;
+        bake->nextKeyframeIndex = 1;
+        BakeWritePreviewFrame(system, bake, 0);
+        BakeWriteKeyframe(system, bake, 0);
+        BakeWriteManifest(system, bake);
+        if (system->acousticAudioLoaded && AcousticsAvailable(system)) {
+            snprintf(bake->notice, sizeof(bake->notice),
+                "Pure SPH audio bake: %d / %d particles, %.0f Hz driver, %.0fx substeps. %.0fs pre-roll, %.0fs post-roll.",
+                system->particleCount, bake->particleTarget,
+                system->acousticWaveformSampleRate,
+                ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE,
+                ACOUSTIC_AUDIO_PREROLL_SECONDS, ACOUSTIC_AUDIO_POSTROLL_SECONDS);
+        } else {
+            snprintf(bake->notice, sizeof(bake->notice),
+                "Baking %d / %d simulated particles on Metal GPU. Playback preview is capped at %d.",
+                system->particleCount, bake->particleTarget, BAKE_PREVIEW_PARTICLE_CAP);
+        }
+    }
+
+    static void BakeStop(BakeSession3D *bake)
+    {
+        if (bake->status == BAKE_STATUS_BAKING) {
+            bake->status = BAKE_STATUS_STOPPED;
+            bake->playbackPlaying = false;
+            BakeSetNotice(bake, "Bake stopped. Cached frames remain playable.");
+        }
+    }
+
+    static void BakeUpdate(ParticleSystem3D *system, BakeSession3D *bake)
+    {
+        if (bake->status != BAKE_STATUS_BAKING) {
+            return;
+        }
+
+        const double start = GetTime();
+        int steps = 0;
+        while (bake->bakedTime < bake->duration && (GetTime() - start) < BAKE_CHUNK_BUDGET_SECONDS) {
+            if (!BakeGpuStepOnce(system)) {
+                bake->status = BAKE_STATUS_STOPPED;
+                bake->playbackPlaying = false;
+                system->bakeCapacityMode = false;
+                BakeSetNotice(bake, "Metal bake step failed; bake stopped without CPU fallback.");
+                break;
+            }
+
+            bake->bakedTime = fmaxf(0.0f, system->simulationTime - bake->startSimulationTime);
+            bake->progress = ClampFloat(bake->bakedTime / fmaxf(bake->duration, 1e-4f), 0.0f, 1.0f);
+            BakeAppendMicSample(bake, bake->bakedTime, system->micSignal);
+
+            while (bake->nextPreviewFrame <= (int)floorf(bake->bakedTime * (float)BAKE_PREVIEW_FPS)) {
+                if (!BakeWritePreviewFrame(system, bake, bake->nextPreviewFrame)) {
+                    bake->status = BAKE_STATUS_STOPPED;
+                    system->bakeCapacityMode = false;
+                    BakeSetNotice(bake, "Preview cache write failed; bake stopped.");
+                    break;
+                }
+                ++bake->nextPreviewFrame;
+            }
+
+            while (bake->nextKeyframeIndex <= (int)floorf(bake->bakedTime / BAKE_KEYFRAME_INTERVAL_SECONDS)) {
+                if (!BakeWriteKeyframe(system, bake, bake->nextKeyframeIndex)) {
+                    bake->status = BAKE_STATUS_STOPPED;
+                    system->bakeCapacityMode = false;
+                    BakeSetNotice(bake, "Keyframe cache write failed; bake stopped.");
+                    break;
+                }
+                ++bake->nextKeyframeIndex;
+            }
+
+            if (bake->status != BAKE_STATUS_BAKING) {
+                break;
+            }
+            ++steps;
+        }
+
+        bake->lastChunkMs = (GetTime() - start) * 1000.0;
+        if (bake->status == BAKE_STATUS_BAKING && bake->progress > 0.001f) {
+            const double now = GetTime();
+            const double wallDelta = fmax(now - bake->lastEtaWallTime, 1e-4);
+            const float simDelta = bake->bakedTime - bake->lastBakedTimeForEta;
+            if (simDelta > 1e-6f) {
+                const float localRate = simDelta / (float)wallDelta;
+                const float localEta = (bake->duration - bake->bakedTime) / fmaxf(localRate, 1e-6f);
+                const float smoothing = (bake->etaSeconds > 0.0f) ? 0.10f : 1.0f;
+                bake->etaSeconds = bake->etaSeconds + (localEta - bake->etaSeconds) * smoothing;
+                bake->lastBakedTimeForEta = bake->bakedTime;
+                bake->lastEtaWallTime = now;
+            }
+        }
+        if (bake->status == BAKE_STATUS_BAKING && bake->bakedTime >= bake->duration) {
+            bake->status = BAKE_STATUS_COMPLETE;
+            bake->bakedTime = bake->duration;
+            bake->progress = 1.0f;
+            bake->etaSeconds = 0.0f;
+            bake->playbackPlaying = false;
+            system->bakeCapacityMode = false;
+            BakeSetNotice(bake, "Bake complete. Use the bottom timeline to play or scrub.");
+        }
+        BakeWriteManifest(system, bake);
+        (void)steps;
+    }
+
+    static bool BakeSetPlaybackTime(ParticleSystem3D *system, BakeSession3D *bake, float playbackTime)
+    {
+        if (!bake->hasCache || bake->previewFrameCount <= 0) {
+            return false;
+        }
+
+        bake->playbackTime = ClampFloat(playbackTime, 0.0f, fmaxf(bake->bakedTime, 0.0f));
+        const int frameIndex = ClampInt((int)lrintf(bake->playbackTime * (float)BAKE_PREVIEW_FPS), 0, bake->previewFrameCount - 1);
+        if (BakeLoadPreviewFrame(system, bake, frameIndex)) {
+            if (bake->status != BAKE_STATUS_BAKING) {
+                bake->status = BAKE_STATUS_PLAYBACK;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    static void BakePlaybackUpdate(ParticleSystem3D *system, BakeSession3D *bake, float frameDelta)
+    {
+        if (!bake->playbackPlaying || !bake->hasCache || bake->status == BAKE_STATUS_BAKING) {
+            return;
+        }
+
+        const float nextTime = bake->playbackTime + frameDelta;
+        if (nextTime >= bake->bakedTime) {
+            bake->playbackPlaying = false;
+            BakeSetPlaybackTime(system, bake, bake->bakedTime);
+            return;
+        }
+        BakeSetPlaybackTime(system, bake, nextTime);
+    }
+
+    static bool BakeLoadLatest(ParticleSystem3D *system, BakeSession3D *bake)
+    {
+        char latestPath[BAKE_PATH_MAX];
+        MakeProjectPath("bakes/latest.txt", latestPath, sizeof(latestPath));
+        FILE *latest = fopen(latestPath, "rb");
+        if (latest == NULL) {
+            BakeSetNotice(bake, "No latest bake cache found.");
+            return false;
+        }
+
+        char cacheDir[BAKE_PATH_MAX];
+        if (fgets(cacheDir, sizeof(cacheDir), latest) == NULL) {
+            fclose(latest);
+            BakeSetNotice(bake, "Latest bake cache path is empty.");
+            return false;
+        }
+        fclose(latest);
+        cacheDir[strcspn(cacheDir, "\r\n")] = '\0';
+
+        char manifestPath[BAKE_PATH_MAX];
+        snprintf(manifestPath, sizeof(manifestPath), "%s/manifest.txt", cacheDir);
+        FILE *manifest = fopen(manifestPath, "rb");
+        if (manifest == NULL) {
+            BakeSetNotice(bake, "Latest bake manifest missing.");
+            return false;
+        }
+
+        float duration = BAKE_DEFAULT_DURATION_SECONDS;
+        float bakedTime = 0.0f;
+        int target = BAKE_DEFAULT_PARTICLE_COUNT;
+        int previewFrames = 0;
+        int keyframes = 0;
+        char line[512];
+        while (fgets(line, sizeof(line), manifest) != NULL) {
+            if (sscanf(line, "duration=%f", &duration) == 1) continue;
+            if (sscanf(line, "baked_time=%f", &bakedTime) == 1) continue;
+            if (sscanf(line, "particle_target=%d", &target) == 1) continue;
+            if (sscanf(line, "preview_frames=%d", &previewFrames) == 1) continue;
+            if (sscanf(line, "keyframes=%d", &keyframes) == 1) continue;
+        }
+        fclose(manifest);
+
+        BakeSessionFree(bake);
+        BakeSessionInit(bake);
+        snprintf(bake->cacheDir, sizeof(bake->cacheDir), "%s", cacheDir);
+        snprintf(bake->latestPath, sizeof(bake->latestPath), "%s", latestPath);
+        bake->duration = fmaxf(duration, BAKE_MIN_DURATION_SECONDS);
+        bake->bakedTime = ClampFloat(bakedTime, 0.0f, bake->duration);
+        bake->particleTarget = ClampInt(target, 1, BAKE_MAX_PARTICLE_COUNT);
+        bake->previewFrameCount = previewFrames;
+        bake->keyframeCount = keyframes;
+        bake->progress = (bake->duration > 0.0f) ? ClampFloat(bake->bakedTime / bake->duration, 0.0f, 1.0f) : 0.0f;
+        bake->status = BAKE_STATUS_PLAYBACK;
+        bake->hasCache = previewFrames > 0;
+        bake->canExportMic = false;
+        BakeSetNotice(bake, "Loaded latest bake preview cache.");
+        return BakeSetPlaybackTime(system, bake, 0.0f);
+    }
+
     static void ResetCamera(OrbitCameraState *orbit, Camera3D *camera, const ParticleSystem3D *system)
     {
         orbit->target = system->boundsCenter;
         orbit->yaw = -0.78f;
         orbit->pitch = 0.38f;
         orbit->distance = fmaxf(system->boundsSize.x, system->boundsSize.z) * 1.20f;
+        orbit->flyMode = false;
         camera->target = orbit->target;
         camera->position = (Vector3){
             orbit->target.x + cosf(orbit->yaw) * cosf(orbit->pitch) * orbit->distance,
@@ -4735,10 +6328,87 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         camera->up = (Vector3){0.0f, 1.0f, 0.0f};
         camera->fovy = 45.0f;
         camera->projection = CAMERA_PERSPECTIVE;
+        orbit->flyPosition = camera->position;
+        orbit->flyYaw = orbit->yaw + PI_F;
+        orbit->flyPitch = -orbit->pitch;
     }
 
-    static void UpdateOrbitCamera(OrbitCameraState *orbit, Camera3D *camera, const ParticleSystem3D *system, bool allowMouseInput)
+    static Vector3 FlyCameraForward(const OrbitCameraState *orbit)
     {
+        return Vector3Normalize((Vector3){
+            cosf(orbit->flyYaw) * cosf(orbit->flyPitch),
+            sinf(orbit->flyPitch),
+            sinf(orbit->flyYaw) * cosf(orbit->flyPitch),
+        });
+    }
+
+    static void SetFlyCameraMode(OrbitCameraState *orbit, Camera3D *camera, const ParticleSystem3D *system, bool flyMode)
+    {
+        if (orbit->flyMode == flyMode) {
+            return;
+        }
+
+        orbit->flyMode = flyMode;
+        if (flyMode) {
+            const Vector3 forward = Vector3Normalize(Vector3Subtract(camera->target, camera->position));
+            orbit->flyPosition = camera->position;
+            orbit->flyPitch = asinf(ClampFloat(forward.y, -0.98f, 0.98f));
+            orbit->flyYaw = atan2f(forward.z, forward.x);
+        } else {
+            orbit->target = system->boundsCenter;
+            const Vector3 offset = Vector3Subtract(camera->position, orbit->target);
+            orbit->distance = ClampFloat(Vector3Length(offset), 10.0f, fmaxf(system->boundsSize.x, system->boundsSize.z) * 3.10f);
+            if (orbit->distance > 1e-4f) {
+                orbit->pitch = asinf(ClampFloat(offset.y / orbit->distance, -0.98f, 0.98f));
+                orbit->yaw = atan2f(offset.z, offset.x);
+            }
+        }
+    }
+
+    static void UpdateOrbitCamera(OrbitCameraState *orbit, Camera3D *camera, const ParticleSystem3D *system,
+        float frameDelta, bool allowMouseInput, bool allowKeyboardInput)
+    {
+        if (orbit->flyMode) {
+            if (allowMouseInput && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                const Vector2 delta = GetMouseDelta();
+                orbit->flyYaw -= delta.x * 0.0045f;
+                orbit->flyPitch += delta.y * 0.0040f;
+            }
+            orbit->flyPitch = ClampFloat(orbit->flyPitch, -1.35f, 1.35f);
+
+            const Vector3 forward = FlyCameraForward(orbit);
+            const Vector3 worldUp = {0.0f, 1.0f, 0.0f};
+            Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, worldUp));
+            if (Vector3LengthSqr(right) < 1e-6f) {
+                right = (Vector3){1.0f, 0.0f, 0.0f};
+            }
+            Vector3 move = {0.0f, 0.0f, 0.0f};
+            if (allowKeyboardInput) {
+                if (IsKeyDown(KEY_W)) move = Vector3Add(move, forward);
+                if (IsKeyDown(KEY_S)) move = Vector3Subtract(move, forward);
+                if (IsKeyDown(KEY_D)) move = Vector3Add(move, right);
+                if (IsKeyDown(KEY_A)) move = Vector3Subtract(move, right);
+                if (IsKeyDown(KEY_E)) move = Vector3Add(move, worldUp);
+                if (IsKeyDown(KEY_Q)) move = Vector3Subtract(move, worldUp);
+            }
+            if (Vector3LengthSqr(move) > 1e-6f) {
+                float speed = fmaxf(system->boundsSize.x, system->boundsSize.z) * 0.55f;
+                if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+                    speed *= 2.6f;
+                }
+                if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) {
+                    speed *= 0.30f;
+                }
+                orbit->flyPosition = Vector3Add(orbit->flyPosition,
+                    Vector3Scale(Vector3Normalize(move), speed * fmaxf(frameDelta, 0.0f)));
+            }
+
+            camera->position = orbit->flyPosition;
+            camera->target = Vector3Add(orbit->flyPosition, forward);
+            camera->up = worldUp;
+            return;
+        }
+
         if (allowMouseInput && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             const Vector2 delta = GetMouseDelta();
             orbit->yaw -= delta.x * 0.0045f;
@@ -5271,9 +6941,84 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
     }
 
+    static Vector3 WaterRectangleLocalToWorld(const ParticleSystem3D *system, int index, Vector3 local)
+    {
+        const Vector2 rotated = RotateVector((Vector2){local.x, local.y},
+            system->waterRectangleAngleDegrees[index] * DEG2RAD);
+        return (Vector3){
+            system->waterCylinderX[index] + rotated.x,
+            system->waterCylinderY[index] + rotated.y,
+            system->waterCylinderZ[index] + local.z,
+        };
+    }
+
+    static void DrawWaterRectanglePrism(const ParticleSystem3D *system, int index, Color fill, Color outline)
+    {
+        const float halfWidth = system->waterRectangleWidth[index] * 0.5f;
+        const float halfHeight = system->waterRectangleHeight[index] * 0.5f;
+        const float halfDepth = system->waterCylinderDepth[index] * 0.5f;
+        const Vector2 local2D[4] = {
+            {-halfWidth, -halfHeight},
+            {halfWidth, -halfHeight},
+            {halfWidth, halfHeight},
+            {-halfWidth, halfHeight},
+        };
+
+        Vector3 front[4];
+        Vector3 back[4];
+        for (int i = 0; i < 4; ++i) {
+            front[i] = WaterRectangleLocalToWorld(system, index, (Vector3){local2D[i].x, local2D[i].y, -halfDepth});
+            back[i] = WaterRectangleLocalToWorld(system, index, (Vector3){local2D[i].x, local2D[i].y, halfDepth});
+        }
+
+        DrawTriangle3D(front[0], front[1], front[2], fill);
+        DrawTriangle3D(front[0], front[2], front[3], fill);
+        DrawTriangle3D(back[2], back[1], back[0], fill);
+        DrawTriangle3D(back[3], back[2], back[0], fill);
+        for (int i = 0; i < 4; ++i) {
+            const int next = (i + 1) % 4;
+            DrawTriangle3D(front[i], front[next], back[next], fill);
+            DrawTriangle3D(front[i], back[next], back[i], fill);
+            DrawLine3D(front[i], front[next], outline);
+            DrawLine3D(back[i], back[next], outline);
+            DrawLine3D(front[i], back[i], outline);
+        }
+    }
+
     static void DrawObstacle(const ParticleSystem3D *system)
     {
-        if (!SceneIsWindTunnel(system)) {
+        if (!SolidObstacleActive(system)) {
+            return;
+        }
+
+        if (WaterCylindersActive(system)) {
+            const Color fill = (Color){26, 42, 58, 235};
+            const Color outline = (Color){116, 185, 230, 230};
+            const Color selectedOutline = (Color){185, 230, 255, 255};
+            const int count = ClampInt(system->waterCylinderCount, 0, WATER_CYLINDER_MAX);
+            const int selectedMax = (count > 0) ? count - 1 : 0;
+            const int selected = ClampInt(system->waterCylinderSelected, 0, selectedMax);
+            for (int i = 0; i < count; ++i) {
+                const float halfDepth = system->waterCylinderDepth[i] * 0.5f;
+                const Vector3 start = {system->waterCylinderX[i], system->waterCylinderY[i], system->waterCylinderZ[i] - halfDepth};
+                const Vector3 end = {system->waterCylinderX[i], system->waterCylinderY[i], system->waterCylinderZ[i] + halfDepth};
+                DrawCylinderEx(start, end, system->waterCylinderRadius[i], system->waterCylinderRadius[i], 36, fill);
+                DrawCylinderWiresEx(start, end, system->waterCylinderRadius[i], system->waterCylinderRadius[i],
+                    36, (i == selected) ? selectedOutline : outline);
+            }
+            return;
+        }
+
+        if (WaterRectanglesActive(system)) {
+            const Color fill = (Color){26, 42, 58, 235};
+            const Color outline = (Color){116, 185, 230, 230};
+            const Color selectedOutline = (Color){185, 230, 255, 255};
+            const int count = ClampInt(system->waterCylinderCount, 0, WATER_CYLINDER_MAX);
+            const int selectedMax = (count > 0) ? count - 1 : 0;
+            const int selected = ClampInt(system->waterCylinderSelected, 0, selectedMax);
+            for (int i = 0; i < count; ++i) {
+                DrawWaterRectanglePrism(system, i, fill, (i == selected) ? selectedOutline : outline);
+            }
             return;
         }
 
@@ -5385,7 +7130,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         const int textWidth = MeasureText(label, fontSize);
         const int boxWidth = textWidth + paddingX * 2;
         const int boxHeight = fontSize + paddingY * 2;
-        const int boxX = WINDOW_WIDTH - boxWidth - 18;
+        const int boxX = 18;
         const int boxY = 18;
         const Rectangle box = {(float)boxX, (float)boxY, (float)boxWidth, (float)boxHeight};
         DrawRectangleRec(box, (Color){9, 18, 34, 208});
@@ -5401,14 +7146,30 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
     }
 
-    static Ui3DPanelState BuildUiPanelState(const ParticleSystem3D *system, const OrbitCameraState *orbit)
+    static Ui3DPanelState BuildUiPanelState(const ParticleSystem3D *system, const OrbitCameraState *orbit, const BakeSession3D *bake)
     {
+        const int waterCylinderCount = ClampInt(system->waterCylinderCount, 1, WATER_CYLINDER_MAX);
+        const int waterCylinderSelected = ClampInt(system->waterCylinderSelected, 0, waterCylinderCount - 1);
         Ui3DPanelState state = {
             .backend = (int)system->activeBackend,
-            .targetParticleCount = EffectiveTargetParticleCount(system),
+            .targetParticleCount = (bake->status == BAKE_STATUS_BAKING || bake->hasCache)
+                ? bake->particleTarget
+                : EffectiveTargetParticleCount(system),
             .actualParticleCount = system->particleCount,
             .mode = (int)CurrentUiMode(system),
             .obstacleModel = (int)system->obstacleModel,
+            .waterObstacleEnabled = system->waterObstacleEnabled,
+            .waterObstacleShape = system->waterObstacleShape,
+            .waterCylinderCount = waterCylinderCount,
+            .waterCylinderSelected = waterCylinderSelected,
+            .waterCylinderX = system->waterCylinderX[waterCylinderSelected],
+            .waterCylinderY = system->waterCylinderY[waterCylinderSelected],
+            .waterCylinderZ = system->waterCylinderZ[waterCylinderSelected],
+            .waterCylinderRadius = system->waterCylinderRadius[waterCylinderSelected],
+            .waterCylinderDepth = system->waterCylinderDepth[waterCylinderSelected],
+            .waterRectangleWidth = system->waterRectangleWidth[waterCylinderSelected],
+            .waterRectangleHeight = system->waterRectangleHeight[waterCylinderSelected],
+            .waterRectangleAngleDegrees = system->waterRectangleAngleDegrees[waterCylinderSelected],
             .obstacleAngleDegrees = system->obstacleAngleDegrees,
             .obstacleRectWidth = system->obstacleRectWidth,
             .obstacleRectHeight = system->obstacleRectHeight,
@@ -5423,6 +7184,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             .importedRotationZ = system->importedObstacleRotationDegrees.z,
             .viewMode = (int)system->viewMode,
             .colorMode = (int)system->colorMode,
+            .flyCamera = orbit->flyMode,
             .paused = system->paused,
             .gpuBackendAvailable = system->gpuBackendAvailable,
             .windSpeedScale = system->flowSpeedScale,
@@ -5460,6 +7222,21 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             .audioMonitorPitchHz = system->audioMonitorPitchHz,
             .audioOutputAvailable = system->audioOutputReady,
             .audioOutputEnabled = system->audioOutputEnabled && system->audioOutputReady,
+            .acousticAudioLoaded = system->acousticAudioLoaded,
+            .acousticAudioLabel = system->acousticAudioLoaded ? system->acousticAudioLabel : "procedural",
+            .acousticAudioDuration = system->acousticEnvelopeDuration,
+            .bakeStatus = (int)bake->status,
+            .bakeSimulationLocked = bake->status == BAKE_STATUS_BAKING,
+            .bakeDuration = bake->duration,
+            .bakeParticleCount = bake->particleTarget,
+            .bakeProgress = bake->progress,
+            .bakeBakedTime = bake->bakedTime,
+            .bakeEtaSeconds = bake->etaSeconds,
+            .bakePlaybackTime = bake->playbackTime,
+            .bakePlaybackPlaying = bake->playbackPlaying,
+            .bakeHasCache = bake->hasCache,
+            .bakeCanExportMic = bake->canExportMic,
+            .bakeNotice = bake->notice,
             .micWaveform = system->micWaveformDisplay,
             .micWaveformCount = system->micWaveformCount,
             .fps = (float)GetFPS(),
@@ -5505,6 +7282,10 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             (void)OpenImportedObstacleDialog(system);
         }
 
+        if (actions->requestLoadAcousticAudio) {
+            (void)LoadAcousticAudioFile(system);
+        }
+
         if (actions->setBackend) {
             if (actions->backend == SIM_BACKEND_GPU) {
                 (void)InitializeGpuBackend(system);
@@ -5523,6 +7304,42 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             } else {
                 SetObstacleModel(system, (ObstacleModel)actions->obstacleModel);
             }
+        }
+        if (actions->setWaterObstacleEnabled) {
+            SetWaterObstacleEnabled(system, actions->waterObstacleEnabled);
+        }
+        if (actions->setWaterObstacleShape) {
+            SetWaterObstacleShape(system, actions->waterObstacleShape);
+        }
+        if (actions->setWaterCylinderCount) {
+            SetWaterCylinderCount(system, actions->waterCylinderCount);
+        }
+        if (actions->setWaterCylinderSelected) {
+            SetWaterCylinderSelected(system, actions->waterCylinderSelected);
+        }
+        if (actions->setWaterCylinderX) {
+            SetSelectedWaterCylinderPosition(system, 0, actions->waterCylinderX);
+        }
+        if (actions->setWaterCylinderY) {
+            SetSelectedWaterCylinderPosition(system, 1, actions->waterCylinderY);
+        }
+        if (actions->setWaterCylinderZ) {
+            SetSelectedWaterCylinderPosition(system, 2, actions->waterCylinderZ);
+        }
+        if (actions->setWaterCylinderRadius) {
+            SetSelectedWaterCylinderRadius(system, actions->waterCylinderRadius);
+        }
+        if (actions->setWaterCylinderDepth) {
+            SetSelectedWaterCylinderDepth(system, actions->waterCylinderDepth);
+        }
+        if (actions->setWaterRectangleWidth) {
+            SetSelectedWaterRectangleWidth(system, actions->waterRectangleWidth);
+        }
+        if (actions->setWaterRectangleHeight) {
+            SetSelectedWaterRectangleHeight(system, actions->waterRectangleHeight);
+        }
+        if (actions->setWaterRectangleAngleDegrees) {
+            SetSelectedWaterRectangleAngle(system, actions->waterRectangleAngleDegrees);
         }
         if (actions->setObstacleAngleDegrees) {
             SetObstacleAngleDegrees(system, actions->obstacleAngleDegrees);
@@ -5571,8 +7388,15 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         if (actions->setColorMode) {
             system->colorMode = (ColorMode)actions->colorMode;
         }
+        if (actions->setFlyCamera) {
+            SetFlyCameraMode(orbit, camera, system, actions->flyCamera);
+        }
         if (actions->setPaused) {
             system->paused = actions->paused;
+            if (system->paused) {
+                system->audioOutputSignal = 0.0f;
+                system->audioOutputState = 0.0f;
+            }
         }
         if (actions->setWindSpeedScale) {
             SetWindSpeedScale(system, actions->windSpeedScale);
@@ -5723,8 +7547,15 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             case KEY_ZERO:
                 ResetCamera(orbit, camera, system);
                 break;
+            case KEY_TAB:
+                SetFlyCameraMode(orbit, camera, system, !orbit->flyMode);
+                break;
             case KEY_SPACE:
                 system->paused = !system->paused;
+                if (system->paused) {
+                    system->audioOutputSignal = 0.0f;
+                    system->audioOutputState = 0.0f;
+                }
                 break;
             case KEY_R:
                 ResetSimulation(system, system->preset);
@@ -5774,9 +7605,9 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
     }
 
     static void ProcessInput(ParticleSystem3D *system, OrbitCameraState *orbit, Camera3D *camera,
-        bool allowMouseInput, bool allowKeyboardInput)
+        float frameDelta, bool allowMouseInput, bool allowKeyboardInput)
     {
-        UpdateOrbitCamera(orbit, camera, system, allowMouseInput);
+        UpdateOrbitCamera(orbit, camera, system, frameDelta, allowMouseInput, allowKeyboardInput);
         UpdateInteraction(system, *camera, allowMouseInput);
 
         for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed()) {
@@ -5816,6 +7647,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         if (system->cellOffsets != NULL) MemFree(system->cellOffsets);
         if (system->cellNeighborCounts != NULL) MemFree(system->cellNeighborCounts);
         if (system->cellNeighbors != NULL) MemFree(system->cellNeighbors);
+        if (system->acousticEnvelope != NULL) MemFree(system->acousticEnvelope);
+        if (system->acousticWaveform != NULL) MemFree(system->acousticWaveform);
         if (system->x != NULL) MemFree(system->x);
         if (system->y != NULL) MemFree(system->y);
         if (system->z != NULL) MemFree(system->z);
@@ -5863,6 +7696,9 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system.particleShader = LoadParticleShader(&system.particleShaderSoftPowerLoc);
         ResetSimulation(&system, MATERIAL_WATER);
 
+        BakeSession3D bake;
+        BakeSessionInit(&bake);
+
         if (InitializeGpuBackend(&system)) {
             SetSimulationBackend(&system, SIM_BACKEND_GPU);
         }
@@ -5900,15 +7736,80 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             ClearBackground((Color){5, 10, 18, 255});
 
             Ui3DPanelBegin(frameDelta);
-            const Ui3DPanelState panelState = BuildUiPanelState(&system, &orbit);
+            const Ui3DPanelState panelState = BuildUiPanelState(&system, &orbit, &bake);
             Ui3DPanelActions panelActions;
             Ui3DPanelDraw(&panelState, &panelActions);
             const Ui3DCaptureState captureState = Ui3DPanelGetCaptureState();
 
             ApplyUiPanelActions(&system, &panelActions, &orbit, &camera);
-            ProcessInput(&system, &orbit, &camera, !captureState.wantsMouse, !captureState.wantsKeyboard);
 
-            if (!system.paused) {
+            const bool liveSceneChanged =
+                panelActions.setBackend || panelActions.setTargetParticleCount || panelActions.setMode ||
+                panelActions.setObstacleModel || panelActions.setObstacleAngleDegrees ||
+                panelActions.setObstacleRectWidth || panelActions.setObstacleRectHeight ||
+                panelActions.setWaterObstacleEnabled || panelActions.setWaterObstacleShape ||
+                panelActions.setWaterCylinderCount ||
+                panelActions.setWaterCylinderSelected || panelActions.setWaterCylinderX ||
+                panelActions.setWaterCylinderY || panelActions.setWaterCylinderZ ||
+                panelActions.setWaterCylinderRadius || panelActions.setWaterCylinderDepth ||
+                panelActions.setWaterRectangleWidth || panelActions.setWaterRectangleHeight ||
+                panelActions.setWaterRectangleAngleDegrees ||
+                panelActions.requestImportObstacle || panelActions.setImportedScale ||
+                panelActions.setImportedOffsetX || panelActions.setImportedOffsetY || panelActions.setImportedOffsetZ ||
+                panelActions.setImportedRotationX || panelActions.setImportedRotationY || panelActions.setImportedRotationZ ||
+                panelActions.requestResetImportedRotation || panelActions.setAcousticsEnabled ||
+                panelActions.setSpeakerFrequency || panelActions.setSpeakerAmplitude ||
+                panelActions.setAcousticSoundSpeed || panelActions.setAcousticMachLimit ||
+                panelActions.setAcousticViscosityScale || panelActions.setAcousticDragScale ||
+                panelActions.requestLoadAcousticAudio ||
+                panelActions.setSpeakerWidth || panelActions.setSpeakerHeight || panelActions.setSpeakerDepth ||
+                panelActions.setMicRadius || panelActions.requestReset;
+            if (liveSceneChanged && bake.status != BAKE_STATUS_BAKING && !panelActions.requestBakeStart) {
+                bake.status = BAKE_STATUS_IDLE;
+                bake.hasCache = false;
+                bake.playbackPlaying = false;
+                bake.progress = 0.0f;
+                bake.bakedTime = 0.0f;
+                BakeSetNotice(&bake, "Bake cache detached after scene edit.");
+            }
+
+            if (panelActions.setBakeDuration) {
+                bake.duration = ClampFloat(panelActions.bakeDuration, BAKE_MIN_DURATION_SECONDS, BAKE_MAX_DURATION_SECONDS);
+            }
+            if (panelActions.setBakeParticleCount) {
+                bake.particleTarget = ClampInt(panelActions.bakeParticleCount, 1, BAKE_MAX_PARTICLE_COUNT);
+            }
+            if (panelActions.requestBakeStop) {
+                BakeStop(&bake);
+                system.bakeCapacityMode = false;
+                BakeWriteManifest(&system, &bake);
+            }
+            if (panelActions.requestBakeLoadLatest) {
+                (void)BakeLoadLatest(&system, &bake);
+            }
+            if (panelActions.requestBakeExportMic) {
+                (void)BakeExportMicWav(&bake);
+            }
+            if (panelActions.requestBakeStart) {
+                BakeStart(&system, &bake);
+            }
+            if (panelActions.setBakePlaybackPlaying && bake.hasCache && bake.status != BAKE_STATUS_BAKING) {
+                bake.playbackPlaying = panelActions.bakePlaybackPlaying;
+                if (bake.playbackPlaying) {
+                    bake.status = BAKE_STATUS_PLAYBACK;
+                }
+            }
+            if (panelActions.setBakePlaybackTime && bake.status != BAKE_STATUS_BAKING) {
+                (void)BakeSetPlaybackTime(&system, &bake, panelActions.bakePlaybackTime);
+            }
+
+            ProcessInput(&system, &orbit, &camera, frameDelta, !captureState.wantsMouse, !captureState.wantsKeyboard);
+
+            if (bake.status == BAKE_STATUS_BAKING) {
+                BakeUpdate(&system, &bake);
+            } else if (bake.status == BAKE_STATUS_PLAYBACK || bake.playbackPlaying) {
+                BakePlaybackUpdate(&system, &bake, frameDelta);
+            } else if (!bake.hasCache && !system.paused) {
                 StepSimulation(&system, frameDelta);
             } else {
                 const bool needsFreshDensity = ColorModeNeedsFreshDensity(system.colorMode);
@@ -5931,7 +7832,13 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 system.lastStepDt = 0.0f;
             }
 
-            RefreshVisualizationState(&system, frameDelta);
+            const bool playbackMode = (bake.status == BAKE_STATUS_PLAYBACK);
+            const bool pausedBeforeVisualization = system.paused;
+            if (playbackMode) {
+                system.paused = true;
+            }
+            RefreshVisualizationState(&system, playbackMode ? 0.0f : frameDelta);
+            system.paused = pausedBeforeVisualization;
 
             BeginMode3D(camera);
             DrawWorld(&system, camera);
@@ -5945,6 +7852,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
 
         Ui3DPanelShutdown();
+        BakeSessionFree(&bake);
         Cleanup(&system);
         CloseWindow();
         return 0;

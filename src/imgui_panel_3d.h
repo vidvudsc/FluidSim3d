@@ -14,6 +14,22 @@ typedef enum Ui3DSimMode {
     UI_3D_MODE_COUNT
 } Ui3DSimMode;
 
+typedef enum Ui3DBakeStatus {
+    UI_3D_BAKE_IDLE = 0,
+    UI_3D_BAKE_BAKING,
+    UI_3D_BAKE_STOPPED,
+    UI_3D_BAKE_COMPLETE,
+    UI_3D_BAKE_PLAYBACK
+} Ui3DBakeStatus;
+
+#define UI_3D_WATER_CYLINDER_MAX 16
+
+typedef enum Ui3DWaterObstacleShape {
+    UI_3D_WATER_OBSTACLE_CYLINDERS = 0,
+    UI_3D_WATER_OBSTACLE_RECTANGLES,
+    UI_3D_WATER_OBSTACLE_SHAPE_COUNT
+} Ui3DWaterObstacleShape;
+
 typedef struct Ui3DCaptureState {
     bool wantsMouse;
     bool wantsKeyboard;
@@ -25,6 +41,18 @@ typedef struct Ui3DPanelState {
     int actualParticleCount;
     int mode;
     int obstacleModel;
+    bool waterObstacleEnabled;
+    int waterObstacleShape;
+    int waterCylinderCount;
+    int waterCylinderSelected;
+    float waterCylinderX;
+    float waterCylinderY;
+    float waterCylinderZ;
+    float waterCylinderRadius;
+    float waterCylinderDepth;
+    float waterRectangleWidth;
+    float waterRectangleHeight;
+    float waterRectangleAngleDegrees;
     float obstacleAngleDegrees;
     float obstacleRectWidth;
     float obstacleRectHeight;
@@ -39,6 +67,7 @@ typedef struct Ui3DPanelState {
     float importedRotationZ;
     int viewMode;
     int colorMode;
+    bool flyCamera;
     bool paused;
     bool gpuBackendAvailable;
     float windSpeedScale;
@@ -74,6 +103,21 @@ typedef struct Ui3DPanelState {
     float audioMonitorPitchHz;
     bool audioOutputAvailable;
     bool audioOutputEnabled;
+    bool acousticAudioLoaded;
+    const char *acousticAudioLabel;
+    float acousticAudioDuration;
+    int bakeStatus;
+    bool bakeSimulationLocked;
+    float bakeDuration;
+    int bakeParticleCount;
+    float bakeProgress;
+    float bakeBakedTime;
+    float bakeEtaSeconds;
+    float bakePlaybackTime;
+    bool bakePlaybackPlaying;
+    bool bakeHasCache;
+    bool bakeCanExportMic;
+    const char *bakeNotice;
     const float *micWaveform;
     int micWaveformCount;
     float fps;
@@ -90,6 +134,30 @@ typedef struct Ui3DPanelActions {
     int mode;
     bool setObstacleModel;
     int obstacleModel;
+    bool setWaterObstacleEnabled;
+    bool waterObstacleEnabled;
+    bool setWaterObstacleShape;
+    int waterObstacleShape;
+    bool setWaterCylinderCount;
+    int waterCylinderCount;
+    bool setWaterCylinderSelected;
+    int waterCylinderSelected;
+    bool setWaterCylinderX;
+    float waterCylinderX;
+    bool setWaterCylinderY;
+    float waterCylinderY;
+    bool setWaterCylinderZ;
+    float waterCylinderZ;
+    bool setWaterCylinderRadius;
+    float waterCylinderRadius;
+    bool setWaterCylinderDepth;
+    float waterCylinderDepth;
+    bool setWaterRectangleWidth;
+    float waterRectangleWidth;
+    bool setWaterRectangleHeight;
+    float waterRectangleHeight;
+    bool setWaterRectangleAngleDegrees;
+    float waterRectangleAngleDegrees;
     bool setObstacleAngleDegrees;
     float obstacleAngleDegrees;
     bool setObstacleRectWidth;
@@ -116,6 +184,8 @@ typedef struct Ui3DPanelActions {
     int viewMode;
     bool setColorMode;
     int colorMode;
+    bool setFlyCamera;
+    bool flyCamera;
     bool setPaused;
     bool paused;
     bool setWindSpeedScale;
@@ -174,6 +244,19 @@ typedef struct Ui3DPanelActions {
     float micRadius;
     bool setAudioOutputEnabled;
     bool audioOutputEnabled;
+    bool requestLoadAcousticAudio;
+    bool setBakeDuration;
+    float bakeDuration;
+    bool setBakeParticleCount;
+    int bakeParticleCount;
+    bool requestBakeStart;
+    bool requestBakeStop;
+    bool requestBakeLoadLatest;
+    bool requestBakeExportMic;
+    bool setBakePlaybackTime;
+    float bakePlaybackTime;
+    bool setBakePlaybackPlaying;
+    bool bakePlaybackPlaying;
     bool requestReset;
     bool requestCameraReset;
 } Ui3DPanelActions;
