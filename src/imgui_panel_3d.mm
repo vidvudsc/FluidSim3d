@@ -702,10 +702,12 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
             ImGui::SameLine();
             ImGui::TextDisabled("%s", state->acousticAudioLoaded ? state->acousticAudioLabel : "procedural");
             if (state->acousticAudioLoaded) {
-                ImGui::TextDisabled("Driver %.0f Hz slowed %.0fx; restored bandwidth estimate %.0f Hz.",
-                    state->acousticDriverHz, state->acousticSlowdownFactor, state->acousticRestoredBandwidthHz);
+                ImGui::TextDisabled("Source target %.0f Hz; driver %.0f Hz; slowed %.0fx.",
+                    state->acousticAudioBandwidthHz, state->acousticDriverHz, state->acousticSlowdownFactor);
+                ImGui::TextDisabled("Restored bandwidth estimate %.0f Hz after slow-motion playback.",
+                    state->acousticRestoredBandwidthHz);
                 ImGui::TextDisabled("Export is the compressed SPH mic pressure, not the original source mixed back in.");
-                ImGui::TextDisabled("If the slider snaps upward, the bake needs that slowdown for the 20 kHz target.");
+                ImGui::TextDisabled("If the slider snaps upward, the bake needs that slowdown for the analyzed source target.");
             } else {
                 ImGui::TextDisabled("Procedural mode drives a moving speaker slab through the gas.");
             }

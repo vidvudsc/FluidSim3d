@@ -95,6 +95,12 @@
     #define ACOUSTIC_AUDIO_MIN_SLOWDOWN_FACTOR 100.0f
     #define ACOUSTIC_AUDIO_MAX_SLOWDOWN_FACTOR 2400.0f
     #define ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ 20000.0f
+    #define ACOUSTIC_AUDIO_MIN_TARGET_BANDWIDTH_HZ 1000.0f
+    #define ACOUSTIC_AUDIO_BANDWIDTH_HEADROOM 1.15f
+    #define ACOUSTIC_AUDIO_ANALYSIS_FFT_SIZE 4096
+    #define ACOUSTIC_AUDIO_ANALYSIS_MAX_WINDOWS 96
+    #define ACOUSTIC_AUDIO_ANALYSIS_ROLLOFF 0.997f
+    #define ACOUSTIC_AUDIO_ANALYSIS_GATE_RATIO 0.00003f
     #define ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE 4.0f
     #define ACOUSTIC_AUDIO_BAKE_MIN_SUBSTEPS_PER_SAMPLE 16.0f
     #define WATER_CYLINDER_MAX UI_3D_WATER_CYLINDER_MAX
@@ -478,6 +484,7 @@
         float *acousticWaveform;
         int acousticWaveformCount;
         float acousticWaveformSampleRate;
+        float acousticAudioBandwidthHz;
         float acousticAudioSlowdownFactor;
         bool audioOutputEnabled;
         bool audioOutputReady;
@@ -1798,10 +1805,20 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return EffectiveAcousticSoundSpeed(system) / (6.0f * h);
     }
 
+    static float AcousticAudioTargetBandwidthHz(const ParticleSystem3D *system)
+    {
+        if (system != NULL && system->acousticAudioLoaded && system->acousticAudioBandwidthHz > 0.0f) {
+            return ClampFloat(system->acousticAudioBandwidthHz,
+                ACOUSTIC_AUDIO_MIN_TARGET_BANDWIDTH_HZ,
+                ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ);
+        }
+        return ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ;
+    }
+
     static float AcousticRequiredSlowdownForBakeTarget(const ParticleSystem3D *system, int targetParticles)
     {
         const float resolvedHz = AcousticResolvedFrequencyEstimateForBakeTarget(system, targetParticles);
-        const float required = ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ / fmaxf(resolvedHz, 1e-4f);
+        const float required = AcousticAudioTargetBandwidthHz(system) / fmaxf(resolvedHz, 1e-4f);
         return ClampFloat(ceilf(required), ACOUSTIC_AUDIO_MIN_SLOWDOWN_FACTOR, ACOUSTIC_AUDIO_MAX_SLOWDOWN_FACTOR);
     }
 
@@ -1858,7 +1875,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->acousticMachLimit = 0.60f;
         system->acousticViscosityScale = 0.05f;
         system->acousticDragScale = 0.0f;
-        system->acousticAudioSlowdownFactor = ACOUSTIC_AUDIO_SLOWDOWN_FACTOR;
+        system->acousticAudioSlowdownFactor = ACOUSTIC_AUDIO_MIN_SLOWDOWN_FACTOR;
         system->speakerAmplitude = 1.4f;
         system->speakerWidth = fmaxf(system->speakerWidth, 22.0f);
         system->speakerHeight = fmaxf(system->speakerHeight, 72.0f);
@@ -2816,6 +2833,153 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return false;
     }
 
+    static void AcousticFft(float *real, float *imag, int n)
+    {
+        for (int i = 1, j = 0; i < n; ++i) {
+            int bit = n >> 1;
+            while ((j & bit) != 0) {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j ^= bit;
+            if (i < j) {
+                const float realTemp = real[i];
+                const float imagTemp = imag[i];
+                real[i] = real[j];
+                imag[i] = imag[j];
+                real[j] = realTemp;
+                imag[j] = imagTemp;
+            }
+        }
+
+        for (int length = 2; length <= n; length <<= 1) {
+            const float angle = -2.0f * PI_F / (float)length;
+            const float stepReal = cosf(angle);
+            const float stepImag = sinf(angle);
+            const int halfLength = length >> 1;
+            for (int base = 0; base < n; base += length) {
+                float wReal = 1.0f;
+                float wImag = 0.0f;
+                for (int offset = 0; offset < halfLength; ++offset) {
+                    const int evenIndex = base + offset;
+                    const int oddIndex = evenIndex + halfLength;
+                    const float oddReal = real[oddIndex] * wReal - imag[oddIndex] * wImag;
+                    const float oddImag = real[oddIndex] * wImag + imag[oddIndex] * wReal;
+                    const float evenReal = real[evenIndex];
+                    const float evenImag = imag[evenIndex];
+                    real[evenIndex] = evenReal + oddReal;
+                    imag[evenIndex] = evenImag + oddImag;
+                    real[oddIndex] = evenReal - oddReal;
+                    imag[oddIndex] = evenImag - oddImag;
+
+                    const float nextReal = wReal * stepReal - wImag * stepImag;
+                    wImag = wReal * stepImag + wImag * stepReal;
+                    wReal = nextReal;
+                }
+            }
+        }
+    }
+
+    static float AnalyzeAudioUsefulBandwidthHz(const float *samples, int sampleCount, float sampleRate)
+    {
+        const float nyquistHz = fmaxf(sampleRate * 0.5f, 0.0f);
+        const float maxTargetHz = fminf(ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ, nyquistHz * 0.98f);
+        if (samples == NULL || sampleCount < 512 || sampleRate <= 0.0f || maxTargetHz <= 0.0f) {
+            return ACOUSTIC_AUDIO_MIN_TARGET_BANDWIDTH_HZ;
+        }
+
+        int fftSize = ACOUSTIC_AUDIO_ANALYSIS_FFT_SIZE;
+        while (fftSize > sampleCount && fftSize > 512) {
+            fftSize >>= 1;
+        }
+        if (fftSize > sampleCount || fftSize < 512) {
+            return ACOUSTIC_AUDIO_MIN_TARGET_BANDWIDTH_HZ;
+        }
+
+        const int binCount = fftSize / 2 + 1;
+        const int maxBin = ClampInt((int)floorf(maxTargetHz * (float)fftSize / sampleRate), 1, binCount - 1);
+        float *binPower = (float *)MemAlloc((size_t)binCount * sizeof(float));
+        float *real = (float *)MemAlloc((size_t)fftSize * sizeof(float));
+        float *imag = (float *)MemAlloc((size_t)fftSize * sizeof(float));
+        if (binPower == NULL || real == NULL || imag == NULL) {
+            if (binPower != NULL) {
+                MemFree(binPower);
+            }
+            if (real != NULL) {
+                MemFree(real);
+            }
+            if (imag != NULL) {
+                MemFree(imag);
+            }
+            return ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ;
+        }
+
+        memset(binPower, 0, (size_t)binCount * sizeof(float));
+        int windowCount = ClampInt(sampleCount / ClampInt(fftSize / 2, 1, fftSize), 1,
+            ACOUSTIC_AUDIO_ANALYSIS_MAX_WINDOWS);
+        if (windowCount <= 1 && sampleCount > fftSize) {
+            windowCount = 2;
+        }
+        const int maxStart = sampleCount - fftSize;
+        for (int windowIndex = 0; windowIndex < windowCount; ++windowIndex) {
+            const int start = (windowCount <= 1 || maxStart <= 0)
+                ? ClampInt(maxStart / 2, 0, (maxStart > 0) ? maxStart : 0)
+                : (int)llround((double)maxStart * (double)windowIndex / (double)(windowCount - 1));
+            for (int i = 0; i < fftSize; ++i) {
+                const float window = 0.5f - 0.5f * cosf(2.0f * PI_F * (float)i / (float)(fftSize - 1));
+                real[i] = samples[start + i] * window;
+                imag[i] = 0.0f;
+            }
+            AcousticFft(real, imag, fftSize);
+            for (int bin = 1; bin <= maxBin; ++bin) {
+                binPower[bin] += real[bin] * real[bin] + imag[bin] * imag[bin];
+            }
+        }
+
+        float totalPower = 0.0f;
+        float peakPower = 0.0f;
+        for (int bin = 1; bin <= maxBin; ++bin) {
+            totalPower += binPower[bin];
+            peakPower = fmaxf(peakPower, binPower[bin]);
+        }
+
+        float targetHz = ACOUSTIC_AUDIO_MIN_TARGET_BANDWIDTH_HZ;
+        if (totalPower > 1e-12f && peakPower > 1e-12f) {
+            const float rolloffTarget = totalPower * ACOUSTIC_AUDIO_ANALYSIS_ROLLOFF;
+            float cumulativePower = 0.0f;
+            int rolloffBin = 1;
+            for (int bin = 1; bin <= maxBin; ++bin) {
+                cumulativePower += binPower[bin];
+                rolloffBin = bin;
+                if (cumulativePower >= rolloffTarget) {
+                    break;
+                }
+            }
+
+            const float gatedPower = peakPower * ACOUSTIC_AUDIO_ANALYSIS_GATE_RATIO;
+            int gatedBin = 1;
+            for (int bin = 1; bin <= maxBin; ++bin) {
+                const float localPower =
+                    binPower[ClampInt(bin - 1, 1, maxBin)] +
+                    binPower[bin] +
+                    binPower[ClampInt(bin + 1, 1, maxBin)];
+                if (localPower >= gatedPower * 3.0f) {
+                    gatedBin = bin;
+                }
+            }
+
+            const float binHz = sampleRate / (float)fftSize;
+            const float rolloffHz = (float)rolloffBin * binHz;
+            const float gatedHz = (float)gatedBin * binHz;
+            targetHz = fmaxf(rolloffHz, gatedHz) * ACOUSTIC_AUDIO_BANDWIDTH_HEADROOM;
+        }
+
+        MemFree(binPower);
+        MemFree(real);
+        MemFree(imag);
+        return ClampFloat(targetHz, ACOUSTIC_AUDIO_MIN_TARGET_BANDWIDTH_HZ, maxTargetHz);
+    }
+
     static void ClearAcousticAudio(ParticleSystem3D *system)
     {
         if (system->acousticEnvelope != NULL) {
@@ -2831,6 +2995,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->acousticEnvelopeDuration = 0.0f;
         system->acousticWaveformCount = 0;
         system->acousticWaveformSampleRate = 0.0f;
+        system->acousticAudioBandwidthHz = 0.0f;
         system->acousticAudioLoaded = false;
         system->acousticAudioPath[0] = '\0';
         snprintf(system->acousticAudioLabel, sizeof(system->acousticAudioLabel), "%s", "procedural");
@@ -2858,6 +3023,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             SetBackendNotice(system, "Audio sample decode failed.");
             return false;
         }
+        const float sourceBandwidthHz = AnalyzeAudioUsefulBandwidthHz(samples, (int)wave.frameCount, (float)wave.sampleRate);
 
         const float envelopeRate = 1000.0f;
         const int envelopeCount = ClampInt((int)ceilf((float)wave.frameCount / (float)wave.sampleRate * envelopeRate) + 2, 2, 600000);
@@ -2923,6 +3089,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->acousticWaveform = waveform;
         system->acousticWaveformCount = waveformCount;
         system->acousticWaveformSampleRate = waveformRate;
+        system->acousticAudioBandwidthHz = sourceBandwidthHz;
         system->acousticAudioLoaded = true;
         system->acousticsEnabled = true;
         snprintf(system->acousticAudioPath, sizeof(system->acousticAudioPath), "%s", path);
@@ -6048,6 +6215,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         fprintf(file, "audio_path=%s\n", system->acousticAudioLoaded ? system->acousticAudioPath : "");
         fprintf(file, "audio_duration=%.6f\n", system->acousticAudioLoaded ? system->acousticEnvelopeDuration : 0.0f);
         fprintf(file, "audio_driver_rate=%.6f\n", system->acousticAudioLoaded ? system->acousticWaveformSampleRate : 0.0f);
+        fprintf(file, "audio_bandwidth_target=%.6f\n", system->acousticAudioLoaded ? AcousticAudioTargetBandwidthHz(system) : 0.0f);
         fprintf(file, "audio_slow_motion=%d\n", bake->audioSlowMotion ? 1 : 0);
         fprintf(file, "audio_slowdown=%.6f\n", bake->audioSlowdownFactor);
         fprintf(file, "audio_driver_substeps=%.6f\n", ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE);
@@ -6467,10 +6635,11 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         BakeWriteManifest(system, bake);
         if (system->acousticAudioLoaded && AcousticsAvailable(system)) {
             snprintf(bake->notice, sizeof(bake->notice),
-                "Slow-motion SPH audio bake: %.0fx slowdown, %.1fs audio -> %.1fs sim. Estimated restored bandwidth %.0f Hz.",
+                "Slow-motion SPH audio bake: %.0fx slowdown, %.1fs audio -> %.1fs sim. Target %.0f Hz; restored estimate %.0f Hz.",
                 bake->audioSlowdownFactor,
                 system->acousticEnvelopeDuration,
                 bake->duration,
+                AcousticAudioTargetBandwidthHz(system),
                 AcousticResolvedFrequencyEstimateForBakeTarget(system, bake->particleTarget) * bake->audioSlowdownFactor);
         } else {
             if (system->importedObstacleLoaded && system->importedSdfBakeQuality) {
@@ -7813,6 +7982,9 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             ? AcousticBakeSlowdownForTarget(system, bakeParticleTarget)
             : AcousticAudioSlowdownFactor(system);
         const float acousticRestoredHz = acousticResolvedHz * acousticSlowdown;
+        const float acousticAudioBandwidthHz = system->acousticAudioLoaded
+            ? AcousticAudioTargetBandwidthHz(system)
+            : 0.0f;
         const float acousticSlowBakeDuration = system->acousticAudioLoaded
             ? (system->acousticEnvelopeDuration * acousticSlowdown +
                 ACOUSTIC_AUDIO_PREROLL_SECONDS + ACOUSTIC_AUDIO_POSTROLL_SECONDS)
@@ -7892,6 +8064,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             .acousticAudioLoaded = system->acousticAudioLoaded,
             .acousticAudioLabel = system->acousticAudioLoaded ? system->acousticAudioLabel : "procedural",
             .acousticAudioDuration = system->acousticEnvelopeDuration,
+            .acousticAudioBandwidthHz = acousticAudioBandwidthHz,
             .acousticResolvedHz = acousticResolvedHz,
             .acousticDriverHz = system->acousticAudioLoaded ? system->acousticWaveformSampleRate : 0.0f,
             .acousticPropagationDelay = AcousticSpeakerMicDelaySeconds(system),

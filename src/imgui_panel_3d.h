@@ -106,6 +106,7 @@ typedef struct Ui3DPanelState {
     bool acousticAudioLoaded;
     const char *acousticAudioLabel;
     float acousticAudioDuration;
+    float acousticAudioBandwidthHz;
     float acousticResolvedHz;
     float acousticDriverHz;
     float acousticPropagationDelay;
