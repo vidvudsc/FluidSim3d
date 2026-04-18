@@ -149,7 +149,7 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
     static const char *const bakeCountLabels[] = {"120k", "250k", "500k", "750k", "1M"};
     static const int bakeCounts[] = {120000, 250000, 500000, 750000, 1000000};
     static const char *const modeLabels[] = {"Water tank", "Gas tank", "Wind tunnel"};
-    static const char *const obstacleLabels[] = {"Circle", "Airfoil", "Car", "Rectangle", "Imported"};
+    static const char *const obstacleLabels[] = {"Cylinder", "Airfoil", "Car", "Rectangle", "Imported"};
     static const char *const waterObstacleShapeLabels[] = {"Cylinders", "Rectangles"};
     static const char *const viewLabels[] = {"Particles", "Smoothing"};
     static const char *const colorLabels[] = {"Material", "Temperature", "Pressure", "Speed", "Density", "Tracer dye", "Vorticity"};
@@ -206,6 +206,7 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
     float acousticMachLimit = state->acousticMachLimit;
     float acousticViscosityScale = state->acousticViscosityScale;
     float acousticDragScale = state->acousticDragScale;
+    float acousticSlowdownFactor = state->acousticSlowdownFactor;
     float audioMonitorPitchHz = state->audioMonitorPitchHz;
     float speakerWidth = state->speakerWidth;
     float speakerHeight = state->speakerHeight;
@@ -294,84 +295,6 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
             ImGui::SameLine();
             if (ImGui::Button("Reset camera")) {
                 actions->requestCameraReset = true;
-            }
-        }
-
-        if (ImGui::CollapsingHeader("Bake", ImGuiTreeNodeFlags_DefaultOpen)) {
-            int bakeCountIndex = 0;
-            for (int i = 0; i < 5; ++i) {
-                if (bakeCounts[i] == state->bakeParticleCount) {
-                    bakeCountIndex = i;
-                    break;
-                }
-            }
-
-            bool bakeCountChanged = false;
-            DrawCombo("Bake particles", bakeCountLabels[bakeCountIndex], bakeCountLabels, 5, bakeCountIndex,
-                &bakeCountIndex, &bakeCountChanged, state->bakeStatus == UI_3D_BAKE_BAKING);
-            if (bakeCountChanged) {
-                actions->setBakeParticleCount = true;
-                actions->bakeParticleCount = bakeCounts[bakeCountIndex];
-            }
-
-            if (state->acousticAudioLoaded) {
-                const float audioBakeDuration = state->acousticAudioDuration + 2.0f;
-                ImGui::TextDisabled("Audio bake duration: 1s + clip %.1fs + 1s = %.1fs",
-                    state->acousticAudioDuration, audioBakeDuration);
-            } else {
-                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
-                    ImGui::BeginDisabled(true);
-                }
-                if (ImGui::SliderFloat("Bake duration", &bakeDuration, 1.0f, 60.0f, "%.1f s")) {
-                    actions->setBakeDuration = true;
-                    actions->bakeDuration = bakeDuration;
-                }
-                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
-                    ImGui::EndDisabled();
-                }
-            }
-
-            ImGui::TextDisabled("Preview cache: 24 fps, max 200k visible particles.");
-            if (state->bakeStatus == UI_3D_BAKE_BAKING) {
-                ImGui::Text("Simulating %d / %d", state->actualParticleCount, state->bakeParticleCount);
-            } else if (state->bakeHasCache) {
-                ImGui::TextDisabled("Playback shows cached preview particles, not the full keyframe count.");
-            }
-            if (state->mode == UI_3D_MODE_GAS_TANK) {
-                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
-                    ImGui::BeginDisabled(true);
-                }
-                if (ImGui::Button("Open WAV/MP3...")) {
-                    actions->requestLoadAcousticAudio = true;
-                }
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", state->acousticAudioLoaded ? state->acousticAudioLabel : "procedural speaker");
-                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
-                    ImGui::EndDisabled();
-                }
-            }
-
-            if (state->bakeStatus == UI_3D_BAKE_BAKING) {
-                if (ImGui::Button("Stop bake")) {
-                    actions->requestBakeStop = true;
-                }
-            } else {
-                if (ImGui::Button("Start GPU bake")) {
-                    actions->requestBakeStart = true;
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Load latest")) {
-                actions->requestBakeLoadLatest = true;
-            }
-            if (state->bakeCanExportMic) {
-                ImGui::SameLine();
-                if (ImGui::Button("Export mic WAV")) {
-                    actions->requestBakeExportMic = true;
-                }
-            }
-            if (state->bakeNotice != nullptr && state->bakeNotice[0] != '\0') {
-                ImGui::TextWrapped("%s", state->bakeNotice);
             }
         }
 
@@ -574,6 +497,85 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
             }
         }
 
+        if (ImGui::CollapsingHeader("Bake", ImGuiTreeNodeFlags_DefaultOpen)) {
+            int bakeCountIndex = 0;
+            for (int i = 0; i < 5; ++i) {
+                if (bakeCounts[i] == state->bakeParticleCount) {
+                    bakeCountIndex = i;
+                    break;
+                }
+            }
+
+            bool bakeCountChanged = false;
+            DrawCombo("Bake particles", bakeCountLabels[bakeCountIndex], bakeCountLabels, 5, bakeCountIndex,
+                &bakeCountIndex, &bakeCountChanged, state->bakeStatus == UI_3D_BAKE_BAKING);
+            if (bakeCountChanged) {
+                actions->setBakeParticleCount = true;
+                actions->bakeParticleCount = bakeCounts[bakeCountIndex];
+            }
+
+            if (state->acousticAudioLoaded) {
+                ImGui::TextDisabled("Slow audio bake: %.0fx, %.1fs clip -> %.1fs sim",
+                    state->acousticSlowdownFactor, state->acousticAudioDuration, state->acousticSlowBakeDuration);
+                ImGui::TextDisabled("Target: SPH %.1f Hz slow-time -> %.0f Hz after export.",
+                    state->acousticResolvedHz, state->acousticRestoredBandwidthHz);
+            } else {
+                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
+                    ImGui::BeginDisabled(true);
+                }
+                if (ImGui::SliderFloat("Bake duration", &bakeDuration, 1.0f, 60.0f, "%.1f s")) {
+                    actions->setBakeDuration = true;
+                    actions->bakeDuration = bakeDuration;
+                }
+                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
+                    ImGui::EndDisabled();
+                }
+            }
+
+            ImGui::TextDisabled("Preview cache: 24 fps, max 200k visible particles.");
+            if (state->bakeStatus == UI_3D_BAKE_BAKING) {
+                ImGui::Text("Simulating %d / %d", state->actualParticleCount, state->bakeParticleCount);
+            } else if (state->bakeHasCache) {
+                ImGui::TextDisabled("Playback shows cached preview particles, not the full keyframe count.");
+            }
+            if (state->mode == UI_3D_MODE_GAS_TANK) {
+                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
+                    ImGui::BeginDisabled(true);
+                }
+                if (ImGui::Button("Open WAV/MP3...")) {
+                    actions->requestLoadAcousticAudio = true;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", state->acousticAudioLoaded ? state->acousticAudioLabel : "procedural speaker");
+                if (state->bakeStatus == UI_3D_BAKE_BAKING) {
+                    ImGui::EndDisabled();
+                }
+            }
+
+            if (state->bakeStatus == UI_3D_BAKE_BAKING) {
+                if (ImGui::Button("Stop bake")) {
+                    actions->requestBakeStop = true;
+                }
+            } else {
+                if (ImGui::Button("Start GPU bake")) {
+                    actions->requestBakeStart = true;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Load latest")) {
+                actions->requestBakeLoadLatest = true;
+            }
+            if (state->bakeCanExportMic) {
+                ImGui::SameLine();
+                if (ImGui::Button(state->acousticAudioLoaded ? "Export simulated audio" : "Export mic WAV")) {
+                    actions->requestBakeExportMic = true;
+                }
+            }
+            if (state->bakeNotice != nullptr && state->bakeNotice[0] != '\0') {
+                ImGui::TextWrapped("%s", state->bakeNotice);
+            }
+        }
+
         if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) {
             bool viewChanged = false;
             DrawCombo("View", viewLabels[viewMode], viewLabels, 2, viewMode, &viewMode, &viewChanged, false);
@@ -605,7 +607,8 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
                 actions->showParticles = showParticles;
             }
 
-            const bool sliceScene = (mode == UI_3D_MODE_GAS_TANK || mode == UI_3D_MODE_WIND_TUNNEL);
+            const bool sliceScene = (mode == UI_3D_MODE_WATER_TANK || mode == UI_3D_MODE_GAS_TANK ||
+                mode == UI_3D_MODE_WIND_TUNNEL);
             if (sliceScene) {
                 if (ImGui::Checkbox("Slice panels", &showSlicePanels)) {
                     actions->setShowSlicePanels = true;
@@ -675,12 +678,8 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
             }
         }
 
-        if (ImGui::CollapsingHeader("Acoustics", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (!state->acousticsAvailable) {
-                ImGui::TextDisabled("Acoustics are available only in Gas tank mode.");
-            }
-
-            ImGui::BeginDisabled(!state->acousticsAvailable || controlsLocked);
+        if (state->acousticsAvailable && ImGui::CollapsingHeader("Acoustics", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::BeginDisabled(controlsLocked);
 
             if (ImGui::Checkbox("Enable speaker + mic", &acousticsEnabled)) {
                 actions->setAcousticsEnabled = true;
@@ -702,7 +701,14 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
             }
             ImGui::SameLine();
             ImGui::TextDisabled("%s", state->acousticAudioLoaded ? state->acousticAudioLabel : "procedural");
-            ImGui::TextDisabled("Audio files drive a stable amplitude envelope, not raw audio-rate pressure.");
+            if (state->acousticAudioLoaded) {
+                ImGui::TextDisabled("Driver %.0f Hz slowed %.0fx; restored bandwidth estimate %.0f Hz.",
+                    state->acousticDriverHz, state->acousticSlowdownFactor, state->acousticRestoredBandwidthHz);
+                ImGui::TextDisabled("Export is the compressed SPH mic pressure, not the original source mixed back in.");
+                ImGui::TextDisabled("If the slider snaps upward, the bake needs that slowdown for the 20 kHz target.");
+            } else {
+                ImGui::TextDisabled("Procedural mode drives a moving speaker slab through the gas.");
+            }
 
             if (ImGui::SliderFloat("Acoustic c", &acousticSoundSpeed, 52.0f, 420.0f, "%.0f")) {
                 actions->setAcousticSoundSpeed = true;
@@ -722,6 +728,13 @@ void Ui3DPanelDraw(const Ui3DPanelState *state, Ui3DPanelActions *actions)
             if (ImGui::SliderFloat("Drag x", &acousticDragScale, 0.00f, 1.00f, "%.2f")) {
                 actions->setAcousticDragScale = true;
                 actions->acousticDragScale = acousticDragScale;
+            }
+
+            if (state->acousticAudioLoaded) {
+                if (ImGui::SliderFloat("Audio slowdown", &acousticSlowdownFactor, 100.0f, 2400.0f, "%.0fx")) {
+                    actions->setAcousticSlowdownFactor = true;
+                    actions->acousticSlowdownFactor = acousticSlowdownFactor;
+                }
             }
 
             if (ImGui::SliderFloat("Speaker width", &speakerWidth, 8.0f, 80.0f, "%.0f px")) {

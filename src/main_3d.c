@@ -14,14 +14,19 @@
     #include <stdlib.h>
     #include <string.h>
     #include <limits.h>
+    #include <stddef.h>
     #include <sys/stat.h>
     #include <time.h>
     #include <unistd.h>
 
     #if defined(__APPLE__)
+    #ifndef GL_SILENCE_DEPRECATION
+    #define GL_SILENCE_DEPRECATION
+    #endif
     #import <AppKit/AppKit.h>
     #import <Foundation/Foundation.h>
     #import <Metal/Metal.h>
+    #import <OpenGL/gl3.h>
     #include <mach-o/dyld.h>
     #endif
 
@@ -46,6 +51,7 @@
     #define GPU_PARTICLE_VIEW_FULL_DRAW_LIMIT 24000
     #define SMOOTH_VIEW_FULL_DRAW_LIMIT 24000
     #define GPU_SMOOTH_VIEW_FULL_DRAW_LIMIT 160000
+    #define PARTICLE_SORT_DRAW_LIMIT 60000
     #define MIC_WAVEFORM_SAMPLES 192
     #define AUDIO_OUTPUT_SAMPLE_RATE 48000
     #define AUDIO_OUTPUT_BUFFER_FRAMES 4096
@@ -65,6 +71,7 @@
     #define STREAMLINE_STEPS_MIN 6
     #define STREAMLINE_STEPS_MAX 40
     #define IMPORTED_SDF_MAX_RES 36
+    #define IMPORTED_SDF_BAKE_MAX_RES 96
     #define IMPORTED_SDF_MIN_RES 14
     #define IMPORTED_OBSTACLE_PATH_MAX 1024
     #define CAR_SHAPE_SCALE_X 0.82f
@@ -83,7 +90,11 @@
     #define BAKE_PATH_MAX 1024
     #define ACOUSTIC_AUDIO_PREROLL_SECONDS 1.0f
     #define ACOUSTIC_AUDIO_POSTROLL_SECONDS 1.0f
-    #define ACOUSTIC_AUDIO_DRIVER_SAMPLE_RATE 24000.0f
+    #define ACOUSTIC_AUDIO_DRIVER_SAMPLE_RATE 48000.0f
+    #define ACOUSTIC_AUDIO_SLOWDOWN_FACTOR 600.0f
+    #define ACOUSTIC_AUDIO_MIN_SLOWDOWN_FACTOR 100.0f
+    #define ACOUSTIC_AUDIO_MAX_SLOWDOWN_FACTOR 2400.0f
+    #define ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ 20000.0f
     #define ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE 4.0f
     #define ACOUSTIC_AUDIO_BAKE_MIN_SUBSTEPS_PER_SAMPLE 16.0f
     #define WATER_CYLINDER_MAX UI_3D_WATER_CYLINDER_MAX
@@ -186,6 +197,17 @@
         float depth;
     } ParticleDrawItem;
 
+    typedef struct ParticleRenderInstance {
+        float x;
+        float y;
+        float z;
+        unsigned char r;
+        unsigned char g;
+        unsigned char b;
+        unsigned char a;
+        float diameter;
+    } ParticleRenderInstance;
+
     typedef struct FlowPathline {
         Vector3 current;
         Vector3 trail[FLOW_PATHLINE_TRAIL_MAX];
@@ -230,6 +252,8 @@
         bool playbackPlaying;
         bool hasCache;
         bool canExportMic;
+        bool audioSlowMotion;
+        float audioSlowdownFactor;
         char cacheDir[BAKE_PATH_MAX];
         char latestPath[BAKE_PATH_MAX];
         char notice[256];
@@ -364,15 +388,28 @@
         Texture2D particleTexture;
         Shader particleShader;
         int particleShaderSoftPowerLoc;
+        Shader particleInstanceShader;
+        int particleInstanceMvpLoc;
+        int particleInstanceRightLoc;
+        int particleInstanceUpLoc;
+        int particleInstanceSoftPowerLoc;
+        unsigned int particleQuadVao;
+        unsigned int particleQuadVbo;
+        unsigned int particleInstanceVbo;
+        int particleInstanceCapacity;
+        ParticleRenderInstance *particleInstances;
         ParticleDrawItem *drawItems;
         int drawItemCount;
         Diagnostics stats;
         double lastSimStepMs;
         float lastStepDt;
         int framesUntilDiagnostics;
+        int framesUntilVorticity;
         bool scalarFieldsDirty;
         bool sortedStateDirty;
         bool vorticityDirty;
+        bool playbackPreviewMode;
+        int playbackPreviewSourceCount;
         bool showParticles;
         bool showSlicePanels;
         bool sliceXEnabled;
@@ -404,6 +441,8 @@
         int importedSdfHeight;
         int importedSdfDepth;
         int importedSdfVoxelCount;
+        int importedSdfMaxResolution;
+        bool importedSdfBakeQuality;
         float *importedSdfValues;
         Vector3 speakerBaseCenter;
         float speakerWidth;
@@ -439,6 +478,7 @@
         float *acousticWaveform;
         int acousticWaveformCount;
         float acousticWaveformSampleRate;
+        float acousticAudioSlowdownFactor;
         bool audioOutputEnabled;
         bool audioOutputReady;
         AudioStream micAudioStream;
@@ -584,7 +624,7 @@
     static void BakePlaybackUpdate(ParticleSystem3D *system, BakeSession3D *bake, float frameDelta);
     static bool BakeSetPlaybackTime(ParticleSystem3D *system, BakeSession3D *bake, float playbackTime);
     static bool BakeLoadLatest(ParticleSystem3D *system, BakeSession3D *bake);
-    static bool BakeExportMicWav(BakeSession3D *bake);
+    static bool BakeExportMicWav(const ParticleSystem3D *system, BakeSession3D *bake);
     static bool LoadAcousticAudioFile(ParticleSystem3D *system);
 
     static const MaterialParams MATERIAL_PRESETS[MATERIAL_COUNT] = {
@@ -751,6 +791,11 @@
     static int DiagnosticRefreshIntervalForBackend(SimulationBackend backend)
     {
         return (backend == SIM_BACKEND_GPU) ? 10 : DIAGNOSTIC_REFRESH_INTERVAL;
+    }
+
+    static int VorticityRefreshIntervalForBackend(SimulationBackend backend)
+    {
+        return (backend == SIM_BACKEND_GPU) ? 4 : 2;
     }
 
     static bool SceneIsWindTunnel(const ParticleSystem3D *system)
@@ -929,6 +974,10 @@
 
     static float SmoothViewCoverageScale(const ParticleSystem3D *system)
     {
+        if (system->playbackPreviewMode && system->playbackPreviewSourceCount > system->particleCount) {
+            const float ratio = (float)system->playbackPreviewSourceCount / (float)fmaxf(system->particleCount, 1);
+            return ClampFloat(1.0f + 0.10f * log2f(fmaxf(ratio, 1.0f)), 1.0f, 1.30f);
+        }
         if (system->viewMode != VIEW_SMOOTHING_RADIUS || system->particleCount <= SMOOTH_VIEW_FULL_DRAW_LIMIT) {
             return 1.0f;
         }
@@ -939,6 +988,10 @@
 
     static float ParticleViewCoverageScale(const ParticleSystem3D *system)
     {
+        if (system->playbackPreviewMode && system->playbackPreviewSourceCount > system->particleCount) {
+            const float ratio = (float)system->playbackPreviewSourceCount / (float)fmaxf(system->particleCount, 1);
+            return ClampFloat(1.0f + 0.12f * log2f(fmaxf(ratio, 1.0f)), 1.0f, 1.35f);
+        }
         const int fullDrawLimit = (system->activeBackend == SIM_BACKEND_GPU)
             ? GPU_PARTICLE_VIEW_FULL_DRAW_LIMIT
             : PARTICLE_VIEW_FULL_DRAW_LIMIT;
@@ -952,6 +1005,9 @@
 
     static int SmoothViewDrawLimit(const ParticleSystem3D *system)
     {
+        if (system->playbackPreviewMode) {
+            return ClampInt(system->particleCount, 1, BAKE_PREVIEW_PARTICLE_CAP);
+        }
         return (system->activeBackend == SIM_BACKEND_GPU)
             ? GPU_SMOOTH_VIEW_FULL_DRAW_LIMIT
             : SMOOTH_VIEW_FULL_DRAW_LIMIT;
@@ -959,6 +1015,9 @@
 
     static int ParticleViewDrawLimit(const ParticleSystem3D *system)
     {
+        if (system->playbackPreviewMode) {
+            return ClampInt(system->particleCount, 1, BAKE_PREVIEW_PARTICLE_CAP);
+        }
         return (system->activeBackend == SIM_BACKEND_GPU)
             ? GPU_PARTICLE_VIEW_FULL_DRAW_LIMIT
             : PARTICLE_VIEW_FULL_DRAW_LIMIT;
@@ -1634,6 +1693,10 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return fmaxf(baseSoundSpeed, system->acousticSoundSpeed);
     }
 
+    static float AcousticAudioSlowdownFactor(const ParticleSystem3D *system);
+    static bool AcousticSlowMotionAudioActive(const ParticleSystem3D *system);
+    static float AcousticDriverTimeFromSimulationTime(const ParticleSystem3D *system, float simulationTime);
+
     static float EffectiveSpeakerAmplitude(const ParticleSystem3D *system)
     {
         if (!AcousticsActive(system)) {
@@ -1654,7 +1717,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             return 1.0f;
         }
 
-        const float samplePosition = (system->simulationTime - ACOUSTIC_AUDIO_PREROLL_SECONDS) *
+        const float driverTime = AcousticDriverTimeFromSimulationTime(system, system->simulationTime);
+        const float samplePosition = (driverTime - ACOUSTIC_AUDIO_PREROLL_SECONDS) *
             system->acousticEnvelopeSampleRate;
         if (samplePosition < 0.0f || samplePosition >= (float)(system->acousticEnvelopeCount - 1)) {
             return 0.0f;
@@ -1703,6 +1767,104 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return ClampFloat((a + b * 2.0f + c * 3.0f + d * 2.0f + e) / 9.0f, -1.0f, 1.0f);
     }
 
+    static float AcousticResolvedFrequencyEstimate(const ParticleSystem3D *system)
+    {
+        const float h = fmaxf(system->params.supportRadius, 1e-4f);
+        return EffectiveAcousticSoundSpeed(system) / (6.0f * h);
+    }
+
+    static float EstimateAcousticBakeSupportRadius(const ParticleSystem3D *system, int targetParticles)
+    {
+        const MaterialParams gas = MATERIAL_PRESETS[MATERIAL_GAS];
+        const Vector3 boundsSize = {
+            (system->boundsSize.x > 0.0f) ? system->boundsSize.x : 150.0f,
+            (system->boundsSize.y > 0.0f) ? system->boundsSize.y : 82.0f,
+            (system->boundsSize.z > 0.0f) ? system->boundsSize.z : 88.0f,
+        };
+        const Vector3 fillSize = {
+            boundsSize.x * 0.98f,
+            boundsSize.y * 0.96f,
+            boundsSize.z * 0.96f,
+        };
+        const float volume = fmaxf(fillSize.x * fillSize.y * fillSize.z, 1.0f);
+        const float targetSpacing = cbrtf(volume / (float)ClampInt(targetParticles, 1, BAKE_MAX_PARTICLE_COUNT));
+        const float resolutionScale = ClampFloat((targetSpacing * 0.96f) / gas.spacing, 0.06f, 1.75f);
+        return fmaxf(gas.supportRadius * resolutionScale, 1e-4f);
+    }
+
+    static float AcousticResolvedFrequencyEstimateForBakeTarget(const ParticleSystem3D *system, int targetParticles)
+    {
+        const float h = EstimateAcousticBakeSupportRadius(system, targetParticles);
+        return EffectiveAcousticSoundSpeed(system) / (6.0f * h);
+    }
+
+    static float AcousticRequiredSlowdownForBakeTarget(const ParticleSystem3D *system, int targetParticles)
+    {
+        const float resolvedHz = AcousticResolvedFrequencyEstimateForBakeTarget(system, targetParticles);
+        const float required = ACOUSTIC_AUDIO_TARGET_BANDWIDTH_HZ / fmaxf(resolvedHz, 1e-4f);
+        return ClampFloat(ceilf(required), ACOUSTIC_AUDIO_MIN_SLOWDOWN_FACTOR, ACOUSTIC_AUDIO_MAX_SLOWDOWN_FACTOR);
+    }
+
+    static float AcousticAudioSlowdownFactor(const ParticleSystem3D *system)
+    {
+        if (system == NULL || system->acousticAudioSlowdownFactor <= 1.0f) {
+            return ACOUSTIC_AUDIO_SLOWDOWN_FACTOR;
+        }
+        return system->acousticAudioSlowdownFactor;
+    }
+
+    static float AcousticBakeSlowdownForTarget(const ParticleSystem3D *system, int targetParticles)
+    {
+        if (!AcousticSlowMotionAudioActive(system)) {
+            return AcousticAudioSlowdownFactor(system);
+        }
+        return fmaxf(AcousticAudioSlowdownFactor(system),
+            AcousticRequiredSlowdownForBakeTarget(system, targetParticles));
+    }
+
+    static bool AcousticSlowMotionAudioActive(const ParticleSystem3D *system)
+    {
+        return system != NULL && system->acousticAudioLoaded &&
+            system->acousticWaveform != NULL &&
+            system->acousticWaveformCount > 1 &&
+            system->acousticWaveformSampleRate > 0.0f;
+    }
+
+    static float AcousticDriverTimeFromSimulationTime(const ParticleSystem3D *system, float simulationTime)
+    {
+        if (!AcousticSlowMotionAudioActive(system)) {
+            return simulationTime;
+        }
+        return ACOUSTIC_AUDIO_PREROLL_SECONDS +
+            (simulationTime - ACOUSTIC_AUDIO_PREROLL_SECONDS) / AcousticAudioSlowdownFactor(system);
+    }
+
+    static float AcousticSpeakerMicDelaySeconds(const ParticleSystem3D *system)
+    {
+        const float dx = system->micPosition.x - system->speakerBaseCenter.x;
+        const float dy = system->micPosition.y - system->speakerBaseCenter.y;
+        const float dz = system->micPosition.z - system->speakerBaseCenter.z;
+        const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+        return distance / fmaxf(EffectiveAcousticSoundSpeed(system), 1e-4f);
+    }
+
+    static void ApplyAudioAcousticPreset(ParticleSystem3D *system)
+    {
+        system->scene = SCENE_TANK;
+        system->tankPreset = MATERIAL_GAS;
+        system->preset = MATERIAL_GAS;
+        system->acousticsEnabled = true;
+        system->acousticSoundSpeed = 420.0f;
+        system->acousticMachLimit = 0.60f;
+        system->acousticViscosityScale = 0.05f;
+        system->acousticDragScale = 0.0f;
+        system->acousticAudioSlowdownFactor = ACOUSTIC_AUDIO_SLOWDOWN_FACTOR;
+        system->speakerAmplitude = 1.4f;
+        system->speakerWidth = fmaxf(system->speakerWidth, 22.0f);
+        system->speakerHeight = fmaxf(system->speakerHeight, 72.0f);
+        system->speakerDepth = fmaxf(system->speakerDepth, 34.0f);
+    }
+
     static void ClampAcousticAnchors(ParticleSystem3D *system)
     {
         const float padding = system->params.particleRadius * 2.0f;
@@ -1741,17 +1903,19 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         float speed = amplitude * angularFrequency * cosf(phase);
         if (system->acousticAudioLoaded && system->acousticWaveform != NULL && system->acousticWaveformCount > 1) {
             const float driverDt = 1.0f / fmaxf(system->acousticWaveformSampleRate, 1.0f);
+            const float driverTime = AcousticDriverTimeFromSimulationTime(system, system->simulationTime);
+            const float slowdown = AcousticAudioSlowdownFactor(system);
             const float previous = visualOnly
-                ? AcousticVisualWaveformSample(system, system->simulationTime - driverDt)
-                : AcousticWaveformSample(system, system->simulationTime - driverDt);
+                ? AcousticVisualWaveformSample(system, driverTime - driverDt)
+                : AcousticWaveformSample(system, driverTime - driverDt);
             const float current = visualOnly
-                ? AcousticVisualWaveformSample(system, system->simulationTime)
-                : AcousticWaveformSample(system, system->simulationTime);
+                ? AcousticVisualWaveformSample(system, driverTime)
+                : AcousticWaveformSample(system, driverTime);
             const float next = visualOnly
-                ? AcousticVisualWaveformSample(system, system->simulationTime + driverDt)
-                : AcousticWaveformSample(system, system->simulationTime + driverDt);
+                ? AcousticVisualWaveformSample(system, driverTime + driverDt)
+                : AcousticWaveformSample(system, driverTime + driverDt);
             displacement = amplitude * current;
-            speed = amplitude * (next - previous) / (2.0f * driverDt);
+            speed = amplitude * (next - previous) / (2.0f * driverDt * slowdown);
             const float maxSurfaceSpeed = ClampFloat(system->acousticMachLimit, 0.05f, 1.25f) *
                 fmaxf(EffectiveAcousticSoundSpeed(system), 1e-4f);
             speed = ClampFloat(speed, -maxSurfaceSpeed, maxSurfaceSpeed);
@@ -1777,6 +1941,10 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
     static float SpeakerPeakSurfaceSpeed(const ParticleSystem3D *system)
     {
+        if (AcousticSlowMotionAudioActive(system)) {
+            return ClampFloat(system->acousticMachLimit, 0.05f, 1.25f) *
+                fmaxf(EffectiveAcousticSoundSpeed(system), 1e-4f);
+        }
         const float angularFrequency = system->speakerFrequency * 2.0f * PI_F;
         return fabsf(EffectiveSpeakerAmplitude(system) * angularFrequency);
     }
@@ -1842,15 +2010,53 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         float weightedPressure = 0.0f;
         float totalWeight = 0.0f;
         const float radius2 = system->micRadius * system->micRadius;
-        for (int i = 0; i < system->particleCount; ++i) {
-            const float dx = system->x[i] - system->micPosition.x;
-            const float dy = system->y[i] - system->micPosition.y;
-            const float dz = system->z[i] - system->micPosition.z;
-            const float r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 < radius2) {
-                const float weight = 1.0f - sqrtf(r2 / fmaxf(radius2, 1e-6f));
-                weightedPressure += system->pressure[i] * weight;
-                totalWeight += weight;
+        if (!system->sortedStateDirty && system->cellStarts != NULL && system->sortedPressure != NULL &&
+            system->gridWidth > 0 && system->gridHeight > 0 && system->gridDepth > 0) {
+            const float searchRadius = system->micRadius + system->params.supportRadius;
+            const int minCellX = ClampInt((int)((system->micPosition.x - searchRadius - system->boundsMin.x) * system->invCellSize),
+                0, system->gridWidth - 1);
+            const int maxCellX = ClampInt((int)((system->micPosition.x + searchRadius - system->boundsMin.x) * system->invCellSize),
+                0, system->gridWidth - 1);
+            const int minCellY = ClampInt((int)((system->micPosition.y - searchRadius - system->boundsMin.y) * system->invCellSize),
+                0, system->gridHeight - 1);
+            const int maxCellY = ClampInt((int)((system->micPosition.y + searchRadius - system->boundsMin.y) * system->invCellSize),
+                0, system->gridHeight - 1);
+            const int minCellZ = ClampInt((int)((system->micPosition.z - searchRadius - system->boundsMin.z) * system->invCellSize),
+                0, system->gridDepth - 1);
+            const int maxCellZ = ClampInt((int)((system->micPosition.z + searchRadius - system->boundsMin.z) * system->invCellSize),
+                0, system->gridDepth - 1);
+
+            for (int cellZ = minCellZ; cellZ <= maxCellZ; ++cellZ) {
+                for (int cellY = minCellY; cellY <= maxCellY; ++cellY) {
+                    for (int cellX = minCellX; cellX <= maxCellX; ++cellX) {
+                        const int cellIndex = (cellZ * system->gridHeight + cellY) * system->gridWidth + cellX;
+                        const int start = system->cellStarts[cellIndex];
+                        const int end = system->cellStarts[cellIndex + 1];
+                        for (int slot = start; slot < end; ++slot) {
+                            const float dx = system->sortedX[slot] - system->micPosition.x;
+                            const float dy = system->sortedY[slot] - system->micPosition.y;
+                            const float dz = system->sortedZ[slot] - system->micPosition.z;
+                            const float r2 = dx * dx + dy * dy + dz * dz;
+                            if (r2 < radius2) {
+                                const float weight = 1.0f - sqrtf(r2 / fmaxf(radius2, 1e-6f));
+                                weightedPressure += system->sortedPressure[slot] * weight;
+                                totalWeight += weight;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int i = 0; i < system->particleCount; ++i) {
+                const float dx = system->x[i] - system->micPosition.x;
+                const float dy = system->y[i] - system->micPosition.y;
+                const float dz = system->z[i] - system->micPosition.z;
+                const float r2 = dx * dx + dy * dy + dz * dz;
+                if (r2 < radius2) {
+                    const float weight = 1.0f - sqrtf(r2 / fmaxf(radius2, 1e-6f));
+                    weightedPressure += system->pressure[i] * weight;
+                    totalWeight += weight;
+                }
             }
         }
 
@@ -1858,7 +2064,12 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         if (system->micWaveformCount == 0) {
             system->micBaseline = sample;
         } else {
-            system->micBaseline = 0.985f * system->micBaseline + 0.015f * sample;
+            float baselineAlpha = 0.015f;
+            if (AcousticSlowMotionAudioActive(system)) {
+                const float tau = fmaxf(0.25f * AcousticAudioSlowdownFactor(system), 1.0f);
+                baselineAlpha = ClampFloat(system->lastStepDt / tau, 0.000001f, 0.015f);
+            }
+            system->micBaseline = (1.0f - baselineAlpha) * system->micBaseline + baselineAlpha * sample;
         }
 
         const float scale = fmaxf(system->params.soundSpeed * system->params.soundSpeed * system->params.restDensity * 0.65f, 1e-4f);
@@ -1977,6 +2188,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->importedSdfHeight = 0;
         system->importedSdfDepth = 0;
         system->importedSdfVoxelCount = 0;
+        system->importedSdfMaxResolution = 0;
+        system->importedSdfBakeQuality = false;
         if (system->importedSdfValues != NULL) {
             MemFree(system->importedSdfValues);
             system->importedSdfValues = NULL;
@@ -2339,7 +2552,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
     }
 
-    static bool BuildImportedObstacleSdf(ParticleSystem3D *system, Model *model)
+    static bool BuildImportedObstacleSdf(ParticleSystem3D *system, Model *model, int maxResolution, bool normalizeGeometry)
     {
         const int triangleCount = ModelTriangleCount(model);
         if (triangleCount <= 0) {
@@ -2386,20 +2599,26 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             return false;
         }
 
-        const Vector3 rawCenter = Vector3Scale(Vector3Add(rawMin, rawMax), 0.5f);
-        const Vector3 rawSize = Vector3Subtract(rawMax, rawMin);
-        const Vector3 targetSize = ImportedObstacleTargetSize(system);
-        const float safeSizeX = fmaxf(rawSize.x, 1e-4f);
-        const float safeSizeY = fmaxf(rawSize.y, 1e-4f);
-        const float safeSizeZ = fmaxf(rawSize.z, 1e-4f);
-        const float scale = fminf(targetSize.x / safeSizeX, fminf(targetSize.y / safeSizeY, targetSize.z / safeSizeZ));
-
         Vector3 localMin = {FLT_MAX, FLT_MAX, FLT_MAX};
         Vector3 localMax = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        Vector3 rawCenter = {0.0f, 0.0f, 0.0f};
+        float scale = 1.0f;
+        if (normalizeGeometry) {
+            rawCenter = Vector3Scale(Vector3Add(rawMin, rawMax), 0.5f);
+            const Vector3 rawSize = Vector3Subtract(rawMax, rawMin);
+            const Vector3 targetSize = ImportedObstacleTargetSize(system);
+            const float safeSizeX = fmaxf(rawSize.x, 1e-4f);
+            const float safeSizeY = fmaxf(rawSize.y, 1e-4f);
+            const float safeSizeZ = fmaxf(rawSize.z, 1e-4f);
+            scale = fminf(targetSize.x / safeSizeX, fminf(targetSize.y / safeSizeY, targetSize.z / safeSizeZ));
+        }
+
         for (int i = 0; i < triangleCursor; ++i) {
-            triangles[i].a = Vector3Scale(Vector3Subtract(triangles[i].a, rawCenter), scale);
-            triangles[i].b = Vector3Scale(Vector3Subtract(triangles[i].b, rawCenter), scale);
-            triangles[i].c = Vector3Scale(Vector3Subtract(triangles[i].c, rawCenter), scale);
+            if (normalizeGeometry) {
+                triangles[i].a = Vector3Scale(Vector3Subtract(triangles[i].a, rawCenter), scale);
+                triangles[i].b = Vector3Scale(Vector3Subtract(triangles[i].b, rawCenter), scale);
+                triangles[i].c = Vector3Scale(Vector3Subtract(triangles[i].c, rawCenter), scale);
+            }
             localMin.x = fminf(localMin.x, fminf(triangles[i].a.x, fminf(triangles[i].b.x, triangles[i].c.x)));
             localMin.y = fminf(localMin.y, fminf(triangles[i].a.y, fminf(triangles[i].b.y, triangles[i].c.y)));
             localMin.z = fminf(localMin.z, fminf(triangles[i].a.z, fminf(triangles[i].b.z, triangles[i].c.z)));
@@ -2413,12 +2632,13 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         localMax = Vector3Add(localMax, (Vector3){padding, padding, padding});
         const Vector3 localSize = Vector3Subtract(localMax, localMin);
         const float maxExtent = fmaxf(localSize.x, fmaxf(localSize.y, localSize.z));
-        const int width = ClampInt((int)lroundf((localSize.x / fmaxf(maxExtent, 1e-4f)) * (float)IMPORTED_SDF_MAX_RES),
-            IMPORTED_SDF_MIN_RES, IMPORTED_SDF_MAX_RES);
-        const int height = ClampInt((int)lroundf((localSize.y / fmaxf(maxExtent, 1e-4f)) * (float)IMPORTED_SDF_MAX_RES),
-            IMPORTED_SDF_MIN_RES, IMPORTED_SDF_MAX_RES);
-        const int depth = ClampInt((int)lroundf((localSize.z / fmaxf(maxExtent, 1e-4f)) * (float)IMPORTED_SDF_MAX_RES),
-            IMPORTED_SDF_MIN_RES, IMPORTED_SDF_MAX_RES);
+        const int sdfMaxResolution = ClampInt(maxResolution, IMPORTED_SDF_MIN_RES, IMPORTED_SDF_BAKE_MAX_RES);
+        const int width = ClampInt((int)lroundf((localSize.x / fmaxf(maxExtent, 1e-4f)) * (float)sdfMaxResolution),
+            IMPORTED_SDF_MIN_RES, sdfMaxResolution);
+        const int height = ClampInt((int)lroundf((localSize.y / fmaxf(maxExtent, 1e-4f)) * (float)sdfMaxResolution),
+            IMPORTED_SDF_MIN_RES, sdfMaxResolution);
+        const int depth = ClampInt((int)lroundf((localSize.z / fmaxf(maxExtent, 1e-4f)) * (float)sdfMaxResolution),
+            IMPORTED_SDF_MIN_RES, sdfMaxResolution);
         const int voxelCount = width * height * depth;
 
         float *sdfValues = (float *)MemAlloc((size_t)voxelCount * sizeof(float));
@@ -2458,16 +2678,21 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         if (system->importedSdfValues != NULL) {
             MemFree(system->importedSdfValues);
         }
-        NormalizeImportedModelGeometry(model, rawCenter, scale);
-        system->importedObstacleRawCenter = (Vector3){0.0f, 0.0f, 0.0f};
-        system->importedObstacleScale = 1.0f;
+        if (normalizeGeometry) {
+            NormalizeImportedModelGeometry(model, rawCenter, scale);
+            system->importedObstacleRawCenter = (Vector3){0.0f, 0.0f, 0.0f};
+            system->importedObstacleScale = 1.0f;
+        }
         system->importedObstacleLocalMin = localMin;
         system->importedObstacleLocalMax = localMax;
         system->importedSdfWidth = width;
         system->importedSdfHeight = height;
         system->importedSdfDepth = depth;
         system->importedSdfVoxelCount = voxelCount;
+        system->importedSdfMaxResolution = sdfMaxResolution;
+        system->importedSdfBakeQuality = sdfMaxResolution > IMPORTED_SDF_MAX_RES;
         system->importedSdfValues = sdfValues;
+        InvalidateGpuBackendState(system);
         return true;
     }
 
@@ -2511,7 +2736,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
         BakeImportedModelTransform(&model);
         UnloadImportedObstacle(system);
-        if (!BuildImportedObstacleSdf(system, &model)) {
+        if (!BuildImportedObstacleSdf(system, &model, IMPORTED_SDF_MAX_RES, true)) {
             UnloadModel(model);
             return false;
         }
@@ -2530,6 +2755,17 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
         InvalidateGpuBackendState(system);
         return true;
+    }
+
+    static bool UpgradeImportedObstacleSdfForBake(ParticleSystem3D *system)
+    {
+        if (!system->importedObstacleLoaded || system->obstacleModel != OBSTACLE_IMPORTED) {
+            return true;
+        }
+        if (system->importedSdfBakeQuality && system->importedSdfMaxResolution >= IMPORTED_SDF_BAKE_MAX_RES) {
+            return true;
+        }
+        return BuildImportedObstacleSdf(system, &system->importedObstacleModel, IMPORTED_SDF_BAKE_MAX_RES, false);
     }
 
     static Material ImportedObstacleMaterial(const Model *model, int meshIndex)
@@ -2693,11 +2929,10 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         snprintf(system->acousticAudioLabel, sizeof(system->acousticAudioLabel), "%s", GetFileName(path));
         UnloadWaveSamples(samples);
         UnloadWave(wave);
-        if (AcousticsAvailable(system)) {
-            ClampAcousticAnchors(system);
-            ResetSimulation(system, system->preset);
-        }
-        SetBackendNotice(system, "Loaded audio waveform for gas acoustics.");
+        ApplyAudioAcousticPreset(system);
+        ResetSimulation(system, MATERIAL_GAS);
+        ClampAcousticAnchors(system);
+        SetBackendNotice(system, "Loaded audio and enabled high-resolution gas acoustic bake setup.");
         return true;
     }
 
@@ -2774,6 +3009,14 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 system->obstacleStrength = system->params.soundSpeed * system->params.soundSpeed * 0.55f;
                 system->obstacleDamping = system->params.soundSpeed * 0.70f / fmaxf(system->params.supportRadius, 1.0f);
                 break;
+        }
+
+        if (system->bakeCapacityMode) {
+            system->obstacleStrength *= 1.28f;
+            system->obstacleDamping *= 1.18f;
+            if (system->obstacleModel == OBSTACLE_IMPORTED) {
+                system->obstacleShell *= 0.88f;
+            }
         }
 
         const float flowScale = fmaxf(system->flowSpeedScale, 0.35f);
@@ -2946,6 +3189,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->acousticMachLimit = 0.30f;
         system->acousticViscosityScale = 0.40f;
         system->acousticDragScale = 0.35f;
+        system->acousticAudioSlowdownFactor = ACOUSTIC_AUDIO_SLOWDOWN_FACTOR;
         system->audioOutputEnabled = true;
         system->audioMonitorPitchHz = 180.0f;
 
@@ -3383,12 +3627,18 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             return;
         }
 
-        const float surfaceOffset = system->params.particleRadius *
-            ((SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f);
+        float surfaceOffsetScale = (SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f;
+        if (system->bakeCapacityMode && SceneIsWindTunnel(system)) {
+            surfaceOffsetScale = (system->obstacleModel == OBSTACLE_IMPORTED) ? 0.52f : fminf(surfaceOffsetScale, 0.62f);
+        }
+        const float surfaceOffset = system->params.particleRadius * surfaceOffsetScale;
         Vector3 normal = {1.0f, 0.0f, 0.0f};
         bool resolved = false;
 
-        const int maxIterations = (SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 4 : 2;
+        int maxIterations = (SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 4 : 2;
+        if (system->bakeCapacityMode && SceneIsWindTunnel(system)) {
+            maxIterations = (system->obstacleModel == OBSTACLE_IMPORTED) ? 5 : ((maxIterations > 3) ? maxIterations : 3);
+        }
         for (int iteration = 0; iteration < maxIterations; ++iteration) {
             const float signedDistance = SolidObstacleSignedDistance(system, system->x[index], system->y[index], system->z[index]);
             if (signedDistance >= surfaceOffset) {
@@ -3397,7 +3647,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
             normal = SolidObstacleNormal(system, system->x[index], system->y[index], system->z[index]);
             const float pushOut = (surfaceOffset - signedDistance) +
-                system->params.particleRadius * ((SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f);
+                system->params.particleRadius * ((system->bakeCapacityMode && SceneIsWindTunnel(system)) ? 0.14f :
+                    ((SceneIsWindTunnel(system) && system->obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f));
             system->x[index] += normal.x * pushOut;
             system->y[index] += normal.y * pushOut;
             system->z[index] += normal.z * pushOut;
@@ -3790,9 +4041,12 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->simulationTime = 0.0f;
         system->lastStepDt = system->params.timeStep;
         system->framesUntilDiagnostics = 0;
+        system->framesUntilVorticity = 0;
         system->scalarFieldsDirty = true;
         system->sortedStateDirty = true;
         system->vorticityDirty = true;
+        system->playbackPreviewMode = false;
+        system->playbackPreviewSourceCount = 0;
 
         float fillWidthRatio = 0.48f;
         float fillHeightRatio = 0.68f;
@@ -4074,6 +4328,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             system->stats.maxVorticity = 0.0f;
             system->stats.avgVorticity = 0.0f;
             system->vorticityDirty = false;
+            system->framesUntilVorticity = VorticityRefreshIntervalForBackend(system->activeBackend);
             return;
         }
 
@@ -4113,6 +4368,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->stats.maxVorticity = maxVorticity;
         system->stats.avgVorticity = sumVorticity / (float)system->particleCount;
         system->vorticityDirty = false;
+        system->framesUntilVorticity = VorticityRefreshIntervalForBackend(system->activeBackend);
     }
 
     static Vector3 SampleVelocityAtPoint(const ParticleSystem3D *system, Vector3 point)
@@ -4257,11 +4513,15 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
 
         if (ColorModeNeedsVorticity(system->colorMode)) {
-            if (system->sortedStateDirty) {
+            const bool shouldRefreshVorticity = system->vorticityDirty &&
+                (system->framesUntilVorticity <= 0 || system->paused);
+            if (shouldRefreshVorticity && system->sortedStateDirty) {
                 BuildGrid(system);
             }
-            if (system->vorticityDirty) {
+            if (shouldRefreshVorticity) {
                 ComputeVorticityField(system);
+            } else if (system->framesUntilVorticity > 0) {
+                system->framesUntilVorticity -= 1;
             }
         }
 
@@ -5469,7 +5729,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 const float speakerWaveDt = 0.20f * h / fmaxf(system->params.soundSpeed + speakerSpeed, 1e-4f);
                 const float speakerPhaseDt = 1.0f / fmaxf(system->speakerFrequency * 24.0f, 1e-4f);
                 const float minDt = system->params.timeStep * 0.05f;
-                dt = ClampFloat(fminf(dt, fminf(speakerWaveDt, speakerPhaseDt)), minDt, maxStep);
+                const float acousticLimit = fminf(dt, fminf(speakerWaveDt, speakerPhaseDt));
+                dt = (minDt < acousticLimit) ? ClampFloat(acousticLimit, minDt, maxStep) : acousticLimit;
             }
             system->lastStepDt = dt;
             if (!RunGpuStep(system, dt)) {
@@ -5479,6 +5740,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 return false;
             }
 
+            system->sortedStateDirty = false;
             SampleMicrophone(system);
             system->simulationTime += dt;
             system->accumulator -= dt;
@@ -5701,6 +5963,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         bake->status = BAKE_STATUS_IDLE;
         bake->duration = BAKE_DEFAULT_DURATION_SECONDS;
         bake->particleTarget = BAKE_DEFAULT_PARTICLE_COUNT;
+        bake->audioSlowMotion = false;
+        bake->audioSlowdownFactor = 1.0f;
         bake->loadedPreviewFrame = -1;
         bake->etaSeconds = 0.0f;
         bake->lastBakedTimeForEta = 0.0f;
@@ -5784,10 +6048,15 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         fprintf(file, "audio_path=%s\n", system->acousticAudioLoaded ? system->acousticAudioPath : "");
         fprintf(file, "audio_duration=%.6f\n", system->acousticAudioLoaded ? system->acousticEnvelopeDuration : 0.0f);
         fprintf(file, "audio_driver_rate=%.6f\n", system->acousticAudioLoaded ? system->acousticWaveformSampleRate : 0.0f);
+        fprintf(file, "audio_slow_motion=%d\n", bake->audioSlowMotion ? 1 : 0);
+        fprintf(file, "audio_slowdown=%.6f\n", bake->audioSlowdownFactor);
         fprintf(file, "audio_driver_substeps=%.6f\n", ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE);
         fprintf(file, "audio_preroll=%.6f\n", ACOUSTIC_AUDIO_PREROLL_SECONDS);
         fprintf(file, "audio_postroll=%.6f\n", ACOUSTIC_AUDIO_POSTROLL_SECONDS);
         fprintf(file, "imported_obj=%s\n", system->importedObstacleLoaded ? system->importedObstaclePath : "");
+        fprintf(file, "imported_sdf_resolution=%d %d %d\n",
+            system->importedSdfWidth, system->importedSdfHeight, system->importedSdfDepth);
+        fprintf(file, "imported_sdf_bake_quality=%d\n", system->importedSdfBakeQuality ? 1 : 0);
         fclose(file);
 
         FILE *latest = fopen(bake->latestPath, "wb");
@@ -5945,26 +6214,36 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->scalarFieldsDirty = true;
         system->sortedStateDirty = true;
         system->vorticityDirty = true;
+        system->playbackPreviewMode = true;
+        system->playbackPreviewSourceCount = (bake->particleTarget > count) ? bake->particleTarget : count;
         bake->previewParticleCount = count;
         bake->loadedPreviewFrame = frameIndex;
         return true;
     }
 
-    static float BakeSampleMicTimeline(const BakeSession3D *bake, float time)
+    static float BakeSampleMicTimelineCursor(const BakeSession3D *bake, float time, int *cursor)
     {
         if (bake->micSampleCount <= 0 || bake->micSamples == NULL) {
             return 0.0f;
         }
         if (time <= bake->micSamples[0].time) {
+            if (cursor != NULL) {
+                *cursor = 1;
+            }
             return bake->micSamples[0].value;
         }
-        int hi = 1;
+
+        int hi = (cursor != NULL) ? ClampInt(*cursor, 1, bake->micSampleCount - 1) : 1;
         while (hi < bake->micSampleCount && bake->micSamples[hi].time < time) {
             ++hi;
+        }
+        if (cursor != NULL) {
+            *cursor = hi;
         }
         if (hi >= bake->micSampleCount) {
             return bake->micSamples[bake->micSampleCount - 1].value;
         }
+
         const BakeMicSample3D a = bake->micSamples[hi - 1];
         const BakeMicSample3D b = bake->micSamples[hi];
         const float span = fmaxf(b.time - a.time, 1e-6f);
@@ -5972,7 +6251,22 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return a.value + (b.value - a.value) * t;
     }
 
-    static bool BakeExportMicWav(BakeSession3D *bake)
+    static bool BakeWritePcm16MonoWav(const char *path, const short *pcm, int frameCount)
+    {
+        if (path == NULL || pcm == NULL || frameCount <= 0) {
+            return false;
+        }
+        Wave wave = {
+            .frameCount = (unsigned int)frameCount,
+            .sampleRate = BAKE_MIC_EXPORT_SAMPLE_RATE,
+            .sampleSize = 16,
+            .channels = 1,
+            .data = (void *)pcm,
+        };
+        return ExportWave(wave, path);
+    }
+
+    static bool BakeExportMicWav(const ParticleSystem3D *system, BakeSession3D *bake)
     {
         if (!bake->canExportMic || bake->micSampleCount <= 1) {
             BakeSetNotice(bake, "No bake mic signal to export yet.");
@@ -5991,35 +6285,60 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         localtime_r(&rawTime, &localTime);
         char stamp[64];
         strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H%M%S", &localTime);
-        snprintf(path, sizeof(path), "%s/mic_export_%s.wav", exportDirectory, stamp);
-        const int frameCount = ClampInt((int)ceilf(fmaxf(bake->bakedTime, 0.05f) * (float)BAKE_MIC_EXPORT_SAMPLE_RATE),
+        const bool slowAudio = system != NULL && AcousticSlowMotionAudioActive(system) && bake->audioSlowMotion;
+        const float exportDuration = slowAudio
+            ? fmaxf(system->acousticEnvelopeDuration, 0.05f)
+            : fmaxf(bake->bakedTime, 0.05f);
+        const int frameCount = ClampInt((int)ceilf(exportDuration * (float)BAKE_MIC_EXPORT_SAMPLE_RATE),
             1, INT_MAX / (int)sizeof(short));
         short *pcm = (short *)MemAlloc((size_t)frameCount * sizeof(short));
-        if (pcm == NULL) {
+        float *samples = (float *)MemAlloc((size_t)frameCount * sizeof(float));
+        if (pcm == NULL || samples == NULL) {
+            if (pcm != NULL) {
+                MemFree(pcm);
+            }
+            if (samples != NULL) {
+                MemFree(samples);
+            }
             BakeSetNotice(bake, "Mic WAV allocation failed.");
             return false;
         }
 
+        const float slowdown = slowAudio ? fmaxf(bake->audioSlowdownFactor, 1.0f) : 1.0f;
+        const float propagationDelay = slowAudio ? AcousticSpeakerMicDelaySeconds(system) : 0.0f;
+        float peak = 1e-6f;
+        int micCursor = 1;
         for (int i = 0; i < frameCount; ++i) {
-            const float t = (float)i / (float)BAKE_MIC_EXPORT_SAMPLE_RATE;
-            const float value = ClampFloat(BakeSampleMicTimeline(bake, t), -1.0f, 1.0f);
-            pcm[i] = (short)lrintf(value * 32767.0f);
+            const float audioTime = (float)i / (float)BAKE_MIC_EXPORT_SAMPLE_RATE;
+            const float sampleTime = slowAudio
+                ? (ACOUSTIC_AUDIO_PREROLL_SECONDS + audioTime * slowdown + propagationDelay)
+                : audioTime;
+            const float value = ClampFloat(BakeSampleMicTimelineCursor(bake, sampleTime, &micCursor), -1.0f, 1.0f);
+            samples[i] = value;
+            peak = fmaxf(peak, fabsf(value));
         }
 
-        Wave wave = {
-            .frameCount = (unsigned int)frameCount,
-            .sampleRate = BAKE_MIC_EXPORT_SAMPLE_RATE,
-            .sampleSize = 16,
-            .channels = 1,
-            .data = pcm,
-        };
-        const bool ok = ExportWave(wave, path);
-        MemFree(pcm);
+        const float normalize = (peak > 1e-5f) ? fminf(0.95f / peak, 18.0f) : 1.0f;
+        for (int i = 0; i < frameCount; ++i) {
+            pcm[i] = (short)lrintf(ClampFloat(samples[i] * normalize, -1.0f, 1.0f) * 32767.0f);
+        }
+
+        snprintf(path, sizeof(path), slowAudio ? "%s/simulated_audio_%s.wav" : "%s/mic_export_%s.wav",
+            exportDirectory, stamp);
+        const bool ok = BakeWritePcm16MonoWav(path, pcm, frameCount);
         if (ok) {
-            snprintf(bake->notice, sizeof(bake->notice), "Exported %s", path);
+            if (slowAudio) {
+                snprintf(bake->notice, sizeof(bake->notice),
+                    "Exported simulated audio %s. Time-compressed %.0fx from the SPH mic signal.",
+                    path, slowdown);
+            } else {
+                snprintf(bake->notice, sizeof(bake->notice), "Exported %s", path);
+            }
         } else {
             BakeSetNotice(bake, "Mic WAV export failed.");
         }
+        MemFree(samples);
+        MemFree(pcm);
         return ok;
     }
 
@@ -6040,13 +6359,16 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                     fmaxf(ACOUSTIC_AUDIO_PREROLL_SECONDS - system->simulationTime, 1e-6f));
             }
             if (audioDriverActive) {
+                const float slowdown = AcousticAudioSlowdownFactor(system);
                 acousticDt = fminf(acousticDt,
-                    1.0f / (system->acousticWaveformSampleRate * ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE));
+                    slowdown / (system->acousticWaveformSampleRate * ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE));
             }
             const float minDt = audioDriverActive
-                ? (1.0f / (system->acousticWaveformSampleRate * ACOUSTIC_AUDIO_BAKE_MIN_SUBSTEPS_PER_SAMPLE))
+                ? (AcousticAudioSlowdownFactor(system) /
+                    (system->acousticWaveformSampleRate * ACOUSTIC_AUDIO_BAKE_MIN_SUBSTEPS_PER_SAMPLE))
                 : (system->params.timeStep * 0.05f);
-            dt = ClampFloat(fminf(dt, acousticDt), minDt, system->params.timeStep);
+            const float acousticLimit = fminf(dt, acousticDt);
+            dt = (minDt < acousticLimit) ? ClampFloat(acousticLimit, minDt, system->params.timeStep) : acousticLimit;
         }
 
         system->lastStepDt = dt;
@@ -6054,6 +6376,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             return false;
         }
 
+        system->sortedStateDirty = false;
         SampleMicrophone(system);
         system->simulationTime += dt;
         system->scalarFieldsDirty = true;
@@ -6072,16 +6395,28 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             }
             system->acousticsEnabled = true;
         }
-        float requestedDuration = ClampFloat(bake->duration, BAKE_MIN_DURATION_SECONDS, BAKE_MAX_DURATION_SECONDS);
-        if (AcousticsAvailable(system) && system->acousticAudioLoaded && system->acousticEnvelopeDuration > 0.0f) {
-            requestedDuration = fmaxf(BAKE_MIN_DURATION_SECONDS,
-                system->acousticEnvelopeDuration + ACOUSTIC_AUDIO_PREROLL_SECONDS + ACOUSTIC_AUDIO_POSTROLL_SECONDS);
-        }
+        const bool slowAudioBake = AcousticsAvailable(system) &&
+            AcousticSlowMotionAudioActive(system) &&
+            system->acousticEnvelopeDuration > 0.0f;
         const int requestedTarget = ClampInt(bake->particleTarget, 1, BAKE_MAX_PARTICLE_COUNT);
+        const float audioSlowdown = slowAudioBake
+            ? AcousticBakeSlowdownForTarget(system, requestedTarget)
+            : AcousticAudioSlowdownFactor(system);
+        if (slowAudioBake) {
+            system->acousticAudioSlowdownFactor = audioSlowdown;
+        }
+        float requestedDuration = ClampFloat(bake->duration, BAKE_MIN_DURATION_SECONDS, BAKE_MAX_DURATION_SECONDS);
+        if (slowAudioBake) {
+            requestedDuration = fmaxf(BAKE_MIN_DURATION_SECONDS,
+                system->acousticEnvelopeDuration * audioSlowdown +
+                ACOUSTIC_AUDIO_PREROLL_SECONDS + ACOUSTIC_AUDIO_POSTROLL_SECONDS);
+        }
         BakeSessionFree(bake);
         BakeSessionInit(bake);
         bake->duration = requestedDuration;
         bake->particleTarget = requestedTarget;
+        bake->audioSlowMotion = slowAudioBake;
+        bake->audioSlowdownFactor = slowAudioBake ? audioSlowdown : 1.0f;
 
         if (!ResizeSystemCapacity(system, requestedTarget)) {
             bake->status = BAKE_STATUS_STOPPED;
@@ -6107,6 +6442,12 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         system->targetParticleCount = requestedTarget;
         system->paused = false;
         system->accumulator = 0.0f;
+        if (!UpgradeImportedObstacleSdfForBake(system)) {
+            bake->status = BAKE_STATUS_STOPPED;
+            system->bakeCapacityMode = false;
+            BakeSetNotice(bake, "Bake OBJ SDF rebuild failed; bake not started.");
+            return;
+        }
         ResetSimulation(system, system->preset);
 
         bake->status = BAKE_STATUS_BAKING;
@@ -6126,15 +6467,23 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         BakeWriteManifest(system, bake);
         if (system->acousticAudioLoaded && AcousticsAvailable(system)) {
             snprintf(bake->notice, sizeof(bake->notice),
-                "Pure SPH audio bake: %d / %d particles, %.0f Hz driver, %.0fx substeps. %.0fs pre-roll, %.0fs post-roll.",
-                system->particleCount, bake->particleTarget,
-                system->acousticWaveformSampleRate,
-                ACOUSTIC_AUDIO_BAKE_SUBSTEPS_PER_SAMPLE,
-                ACOUSTIC_AUDIO_PREROLL_SECONDS, ACOUSTIC_AUDIO_POSTROLL_SECONDS);
+                "Slow-motion SPH audio bake: %.0fx slowdown, %.1fs audio -> %.1fs sim. Estimated restored bandwidth %.0f Hz.",
+                bake->audioSlowdownFactor,
+                system->acousticEnvelopeDuration,
+                bake->duration,
+                AcousticResolvedFrequencyEstimateForBakeTarget(system, bake->particleTarget) * bake->audioSlowdownFactor);
         } else {
-            snprintf(bake->notice, sizeof(bake->notice),
-                "Baking %d / %d simulated particles on Metal GPU. Playback preview is capped at %d.",
-                system->particleCount, bake->particleTarget, BAKE_PREVIEW_PARTICLE_CAP);
+            if (system->importedObstacleLoaded && system->importedSdfBakeQuality) {
+                snprintf(bake->notice, sizeof(bake->notice),
+                    "Baking %d / %d particles with bake OBJ SDF %dx%dx%d. Preview is capped at %d.",
+                    system->particleCount, bake->particleTarget,
+                    system->importedSdfWidth, system->importedSdfHeight, system->importedSdfDepth,
+                    BAKE_PREVIEW_PARTICLE_CAP);
+            } else {
+                snprintf(bake->notice, sizeof(bake->notice),
+                    "Baking %d / %d simulated particles on Metal GPU. Playback preview is capped at %d.",
+                    system->particleCount, bake->particleTarget, BAKE_PREVIEW_PARTICLE_CAP);
+            }
         }
     }
 
@@ -6166,9 +6515,14 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
             bake->bakedTime = fmaxf(0.0f, system->simulationTime - bake->startSimulationTime);
             bake->progress = ClampFloat(bake->bakedTime / fmaxf(bake->duration, 1e-4f), 0.0f, 1.0f);
-            BakeAppendMicSample(bake, bake->bakedTime, system->micSignal);
+            if (AcousticsActive(system)) {
+                BakeAppendMicSample(bake, bake->bakedTime, system->micSignal);
+            }
 
-            while (bake->nextPreviewFrame <= (int)floorf(bake->bakedTime * (float)BAKE_PREVIEW_FPS)) {
+            const float cacheTimeline = bake->audioSlowMotion
+                ? (bake->bakedTime / fmaxf(bake->audioSlowdownFactor, 1.0f))
+                : bake->bakedTime;
+            while (bake->nextPreviewFrame <= (int)floorf(cacheTimeline * (float)BAKE_PREVIEW_FPS)) {
                 if (!BakeWritePreviewFrame(system, bake, bake->nextPreviewFrame)) {
                     bake->status = BAKE_STATUS_STOPPED;
                     system->bakeCapacityMode = false;
@@ -6178,7 +6532,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 ++bake->nextPreviewFrame;
             }
 
-            while (bake->nextKeyframeIndex <= (int)floorf(bake->bakedTime / BAKE_KEYFRAME_INTERVAL_SECONDS)) {
+            while (bake->nextKeyframeIndex <= (int)floorf(cacheTimeline / BAKE_KEYFRAME_INTERVAL_SECONDS)) {
                 if (!BakeWriteKeyframe(system, bake, bake->nextKeyframeIndex)) {
                     bake->status = BAKE_STATUS_STOPPED;
                     system->bakeCapacityMode = false;
@@ -6228,7 +6582,10 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
 
         bake->playbackTime = ClampFloat(playbackTime, 0.0f, fmaxf(bake->bakedTime, 0.0f));
-        const int frameIndex = ClampInt((int)lrintf(bake->playbackTime * (float)BAKE_PREVIEW_FPS), 0, bake->previewFrameCount - 1);
+        const float cacheTimeline = bake->audioSlowMotion
+            ? (bake->playbackTime / fmaxf(bake->audioSlowdownFactor, 1.0f))
+            : bake->playbackTime;
+        const int frameIndex = ClampInt((int)lrintf(cacheTimeline * (float)BAKE_PREVIEW_FPS), 0, bake->previewFrameCount - 1);
         if (BakeLoadPreviewFrame(system, bake, frameIndex)) {
             if (bake->status != BAKE_STATUS_BAKING) {
                 bake->status = BAKE_STATUS_PLAYBACK;
@@ -6547,9 +6904,46 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             };
         }
 
-        if (system->viewMode == VIEW_PARTICLES && drawStride <= 1) {
+        if (system->viewMode == VIEW_PARTICLES && drawStride <= 1 &&
+            system->drawItemCount <= PARTICLE_SORT_DRAW_LIMIT) {
             qsort(system->drawItems, (size_t)system->drawItemCount, sizeof(system->drawItems[0]), CompareDrawItems);
         }
+    }
+
+    static void CameraBillboardBasis(Camera3D camera, Vector3 *rightOut, Vector3 *upOut)
+    {
+        const Vector3 forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+        Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, camera.up));
+        if (Vector3LengthSqr(right) < 1e-6f) {
+            right = (Vector3){1.0f, 0.0f, 0.0f};
+        }
+        Vector3 up = Vector3Normalize(Vector3CrossProduct(right, forward));
+        if (Vector3LengthSqr(up) < 1e-6f) {
+            up = camera.up;
+        }
+        *rightOut = right;
+        *upOut = up;
+    }
+
+    static void DrawParticleBillboardQuad(Vector3 center, Vector3 right, Vector3 up, float diameter, Color color)
+    {
+        const Vector3 rightHalf = Vector3Scale(right, diameter * 0.5f);
+        const Vector3 upHalf = Vector3Scale(up, diameter * 0.5f);
+        const Vector3 bottomLeft = Vector3Subtract(Vector3Subtract(center, rightHalf), upHalf);
+        const Vector3 bottomRight = Vector3Subtract(Vector3Add(center, rightHalf), upHalf);
+        const Vector3 topRight = Vector3Add(Vector3Add(center, rightHalf), upHalf);
+        const Vector3 topLeft = Vector3Add(Vector3Subtract(center, rightHalf), upHalf);
+
+        rlCheckRenderBatchLimit(4);
+        rlColor4ub(color.r, color.g, color.b, color.a);
+        rlTexCoord2f(0.0f, 1.0f);
+        rlVertex3f(bottomLeft.x, bottomLeft.y, bottomLeft.z);
+        rlTexCoord2f(1.0f, 1.0f);
+        rlVertex3f(bottomRight.x, bottomRight.y, bottomRight.z);
+        rlTexCoord2f(1.0f, 0.0f);
+        rlVertex3f(topRight.x, topRight.y, topRight.z);
+        rlTexCoord2f(0.0f, 0.0f);
+        rlVertex3f(topLeft.x, topLeft.y, topLeft.z);
     }
 
     static Texture2D CreateWhiteTexture(void)
@@ -6586,6 +6980,182 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         return shader;
     }
 
+    static Shader LoadParticleInstanceShader(ParticleSystem3D *system)
+    {
+        static const char *const vertexShader =
+            "#version 330\n"
+            "layout(location = 0) in vec2 vertexPosition;\n"
+            "layout(location = 1) in vec2 vertexTexCoord;\n"
+            "layout(location = 2) in vec3 instancePosition;\n"
+            "layout(location = 3) in vec4 instanceColor;\n"
+            "layout(location = 4) in float instanceDiameter;\n"
+            "uniform mat4 uMvp;\n"
+            "uniform vec3 uCameraRight;\n"
+            "uniform vec3 uCameraUp;\n"
+            "out vec2 fragTexCoord;\n"
+            "out vec4 fragColor;\n"
+            "void main() {\n"
+            "    vec3 world = instancePosition + uCameraRight * vertexPosition.x * instanceDiameter + uCameraUp * vertexPosition.y * instanceDiameter;\n"
+            "    gl_Position = uMvp * vec4(world, 1.0);\n"
+            "    fragTexCoord = vertexTexCoord;\n"
+            "    fragColor = instanceColor;\n"
+            "}\n";
+
+        static const char *const fragmentShader =
+            "#version 330\n"
+            "in vec2 fragTexCoord;\n"
+            "in vec4 fragColor;\n"
+            "uniform float uSoftPower;\n"
+            "out vec4 finalColor;\n"
+            "void main() {\n"
+            "    vec2 uv = fragTexCoord * 2.0 - 1.0;\n"
+            "    float r2 = dot(uv, uv);\n"
+            "    if (r2 >= 1.0) discard;\n"
+            "    float radial = max(0.0, 1.0 - r2);\n"
+            "    float alpha = pow(radial, uSoftPower);\n"
+            "    float shading = 0.82 + 0.18 * sqrt(radial);\n"
+            "    float finalAlpha = fragColor.a * alpha;\n"
+            "    finalColor = vec4(fragColor.rgb * shading * finalAlpha, finalAlpha);\n"
+            "}\n";
+
+        Shader shader = LoadShaderFromMemory(vertexShader, fragmentShader);
+        system->particleInstanceMvpLoc = GetShaderLocation(shader, "uMvp");
+        system->particleInstanceRightLoc = GetShaderLocation(shader, "uCameraRight");
+        system->particleInstanceUpLoc = GetShaderLocation(shader, "uCameraUp");
+        system->particleInstanceSoftPowerLoc = GetShaderLocation(shader, "uSoftPower");
+        return shader;
+    }
+
+    static void UnloadParticleInstanceRenderer(ParticleSystem3D *system)
+    {
+        if (system->particleInstances != NULL) {
+            MemFree(system->particleInstances);
+            system->particleInstances = NULL;
+        }
+        system->particleInstanceCapacity = 0;
+        if (system->particleInstanceVbo != 0) {
+            glDeleteBuffers(1, &system->particleInstanceVbo);
+            system->particleInstanceVbo = 0;
+        }
+        if (system->particleQuadVbo != 0) {
+            glDeleteBuffers(1, &system->particleQuadVbo);
+            system->particleQuadVbo = 0;
+        }
+        if (system->particleQuadVao != 0) {
+            glDeleteVertexArrays(1, &system->particleQuadVao);
+            system->particleQuadVao = 0;
+        }
+        if (IsShaderValid(system->particleInstanceShader)) {
+            UnloadShader(system->particleInstanceShader);
+            system->particleInstanceShader = (Shader){0};
+        }
+    }
+
+    static bool EnsureParticleInstanceRenderer(ParticleSystem3D *system, int capacity)
+    {
+        if (capacity <= 0) {
+            return true;
+        }
+
+        if (!IsShaderValid(system->particleInstanceShader)) {
+            system->particleInstanceShader = LoadParticleInstanceShader(system);
+            if (!IsShaderValid(system->particleInstanceShader)) {
+                return false;
+            }
+        }
+
+        const int previousCapacity = system->particleInstanceCapacity;
+        if (system->particleQuadVao == 0) {
+            static const float quadVertices[] = {
+                -0.5f, -0.5f, 0.0f, 1.0f,
+                 0.5f, -0.5f, 1.0f, 1.0f,
+                 0.5f,  0.5f, 1.0f, 0.0f,
+                -0.5f, -0.5f, 0.0f, 1.0f,
+                 0.5f,  0.5f, 1.0f, 0.0f,
+                -0.5f,  0.5f, 0.0f, 0.0f,
+            };
+
+            glGenVertexArrays(1, &system->particleQuadVao);
+            glBindVertexArray(system->particleQuadVao);
+
+            glGenBuffers(1, &system->particleQuadVbo);
+            glBindBuffer(GL_ARRAY_BUFFER, system->particleQuadVbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * (int)sizeof(float), (void *)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * (int)sizeof(float), (void *)(2 * sizeof(float)));
+
+            glGenBuffers(1, &system->particleInstanceVbo);
+            glBindBuffer(GL_ARRAY_BUFFER, system->particleInstanceVbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)capacity * sizeof(ParticleRenderInstance)), NULL, GL_STREAM_DRAW);
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(ParticleRenderInstance),
+                (void *)offsetof(ParticleRenderInstance, x));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ParticleRenderInstance),
+                (void *)offsetof(ParticleRenderInstance, r));
+            glEnableVertexAttribArray(4);
+            glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(ParticleRenderInstance),
+                (void *)offsetof(ParticleRenderInstance, diameter));
+            glVertexAttribDivisor(2, 1);
+            glVertexAttribDivisor(3, 1);
+            glVertexAttribDivisor(4, 1);
+            glBindVertexArray(0);
+            system->particleInstanceCapacity = capacity;
+        }
+
+        if (capacity > system->particleInstanceCapacity) {
+            glBindBuffer(GL_ARRAY_BUFFER, system->particleInstanceVbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)capacity * sizeof(ParticleRenderInstance)), NULL, GL_STREAM_DRAW);
+            system->particleInstanceCapacity = capacity;
+        }
+
+        if (capacity > 0 && system->particleInstances == NULL) {
+            system->particleInstances = (ParticleRenderInstance *)MemAlloc((size_t)capacity * sizeof(ParticleRenderInstance));
+            if (system->particleInstances == NULL) {
+                return false;
+            }
+        } else if (capacity > previousCapacity) {
+            ParticleRenderInstance *next = (ParticleRenderInstance *)MemRealloc(system->particleInstances,
+                (size_t)capacity * sizeof(ParticleRenderInstance));
+            if (next == NULL) {
+                return false;
+            }
+            system->particleInstances = next;
+        }
+
+        return system->particleInstances != NULL;
+    }
+
+    static void DrawParticleInstanceBatch(const ParticleSystem3D *system, Camera3D camera, int instanceCount, float softPower)
+    {
+        if (instanceCount <= 0 || system->particleInstanceVbo == 0 || system->particleQuadVao == 0) {
+            return;
+        }
+
+        Vector3 billboardRight;
+        Vector3 billboardUp;
+        CameraBillboardBasis(camera, &billboardRight, &billboardUp);
+        const Matrix mvp = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
+
+        rlDrawRenderBatchActive();
+        BeginShaderMode(system->particleInstanceShader);
+        SetShaderValueMatrix(system->particleInstanceShader, system->particleInstanceMvpLoc, mvp);
+        SetShaderValue(system->particleInstanceShader, system->particleInstanceRightLoc, &billboardRight, SHADER_UNIFORM_VEC3);
+        SetShaderValue(system->particleInstanceShader, system->particleInstanceUpLoc, &billboardUp, SHADER_UNIFORM_VEC3);
+        SetShaderValue(system->particleInstanceShader, system->particleInstanceSoftPowerLoc, &softPower, SHADER_UNIFORM_FLOAT);
+
+        glBindVertexArray(system->particleQuadVao);
+        glBindBuffer(GL_ARRAY_BUFFER, system->particleInstanceVbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)instanceCount * sizeof(ParticleRenderInstance)),
+            system->particleInstances);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, instanceCount);
+        glBindVertexArray(0);
+        EndShaderMode();
+        rlDrawRenderBatchActive();
+    }
+
     static void DrawParticles(const ParticleSystem3D *system, Camera3D camera)
     {
         const int smoothDrawLimit = SmoothViewDrawLimit(system);
@@ -6612,26 +7182,62 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         } else {
             rlDisableDepthMask();
         }
-        BeginShaderMode(system->particleShader);
-        SetShaderValue(system->particleShader, system->particleShaderSoftPowerLoc, &softPower, SHADER_UNIFORM_FLOAT);
-        for (int i = 0; i < system->drawItemCount; ++i) {
-            const int index = system->drawItems[i].index;
-            Color color = ParticleColor(system, index);
-            if (system->viewMode == VIEW_PARTICLES && drawStride > 1) {
-                const float alphaBoost = ClampFloat(1.0f + 0.10f * log2f((float)drawStride + 1.0f), 1.0f, 1.24f);
-                color.a = (unsigned char)ClampInt((int)lroundf((float)color.a * alphaBoost), 24, 255);
-            }
-            if (system->viewMode == VIEW_SMOOTHING_RADIUS) {
-                const float countScale = sqrtf(fmaxf((float)system->particleCount / (float)smoothDrawLimit, 1.0f));
-                const float alpha = (10.0f / countScale) * powf((float)drawStride, 0.30f);
-                color.a = (unsigned char)ClampInt((int)lroundf(alpha), 5, 32);
-            }
 
-            DrawBillboardPro(camera, system->particleTexture, (Rectangle){0.0f, 0.0f, 1.0f, 1.0f},
-                (Vector3){system->x[index], system->y[index], system->z[index]},
-                camera.up, (Vector2){diameter, diameter}, (Vector2){diameter * 0.5f, diameter * 0.5f}, 0.0f, color);
+        if (EnsureParticleInstanceRenderer((ParticleSystem3D *)system, system->drawItemCount)) {
+            for (int i = 0; i < system->drawItemCount; ++i) {
+                const int index = system->drawItems[i].index;
+                Color color = ParticleColor(system, index);
+                if (system->viewMode == VIEW_PARTICLES && drawStride > 1) {
+                    const float alphaBoost = ClampFloat(1.0f + 0.10f * log2f((float)drawStride + 1.0f), 1.0f, 1.24f);
+                    color.a = (unsigned char)ClampInt((int)lroundf((float)color.a * alphaBoost), 24, 255);
+                }
+                if (system->viewMode == VIEW_SMOOTHING_RADIUS) {
+                    const float countScale = sqrtf(fmaxf((float)system->particleCount / (float)smoothDrawLimit, 1.0f));
+                    const float alpha = (10.0f / countScale) * powf((float)drawStride, 0.30f);
+                    color.a = (unsigned char)ClampInt((int)lroundf(alpha), 5, 32);
+                }
+
+                system->particleInstances[i] = (ParticleRenderInstance){
+                    .x = system->x[index],
+                    .y = system->y[index],
+                    .z = system->z[index],
+                    .r = color.r,
+                    .g = color.g,
+                    .b = color.b,
+                    .a = color.a,
+                    .diameter = diameter,
+                };
+            }
+            DrawParticleInstanceBatch(system, camera, system->drawItemCount, softPower);
+        } else {
+            BeginShaderMode(system->particleShader);
+            SetShaderValue(system->particleShader, system->particleShaderSoftPowerLoc, &softPower, SHADER_UNIFORM_FLOAT);
+            Vector3 billboardRight;
+            Vector3 billboardUp;
+            CameraBillboardBasis(camera, &billboardRight, &billboardUp);
+            rlSetTexture(system->particleTexture.id);
+            rlBegin(RL_QUADS);
+            for (int i = 0; i < system->drawItemCount; ++i) {
+                const int index = system->drawItems[i].index;
+                Color color = ParticleColor(system, index);
+                if (system->viewMode == VIEW_PARTICLES && drawStride > 1) {
+                    const float alphaBoost = ClampFloat(1.0f + 0.10f * log2f((float)drawStride + 1.0f), 1.0f, 1.24f);
+                    color.a = (unsigned char)ClampInt((int)lroundf((float)color.a * alphaBoost), 24, 255);
+                }
+                if (system->viewMode == VIEW_SMOOTHING_RADIUS) {
+                    const float countScale = sqrtf(fmaxf((float)system->particleCount / (float)smoothDrawLimit, 1.0f));
+                    const float alpha = (10.0f / countScale) * powf((float)drawStride, 0.30f);
+                    color.a = (unsigned char)ClampInt((int)lroundf(alpha), 5, 32);
+                }
+
+                DrawParticleBillboardQuad((Vector3){system->x[index], system->y[index], system->z[index]},
+                    billboardRight, billboardUp, diameter, color);
+            }
+            rlEnd();
+            rlSetTexture(0);
+            EndShaderMode();
         }
-        EndShaderMode();
+
         rlEnableDepthMask();
         EndBlendMode();
     }
@@ -6715,7 +7321,8 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
     static void DrawSlicePanels(const ParticleSystem3D *system)
     {
         if (!system->showSlicePanels ||
-            (CurrentUiMode(system) != UI_3D_MODE_GAS_TANK && CurrentUiMode(system) != UI_3D_MODE_WIND_TUNNEL)) {
+            (CurrentUiMode(system) != UI_3D_MODE_WATER_TANK && CurrentUiMode(system) != UI_3D_MODE_GAS_TANK &&
+                CurrentUiMode(system) != UI_3D_MODE_WIND_TUNNEL)) {
             return;
         }
 
@@ -6789,36 +7396,76 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
     static void DrawSliceParticleHighlights(const ParticleSystem3D *system, Camera3D camera)
     {
         if (!system->showSlicePanels ||
-            (CurrentUiMode(system) != UI_3D_MODE_GAS_TANK && CurrentUiMode(system) != UI_3D_MODE_WIND_TUNNEL)) {
+            (CurrentUiMode(system) != UI_3D_MODE_WATER_TANK && CurrentUiMode(system) != UI_3D_MODE_GAS_TANK &&
+                CurrentUiMode(system) != UI_3D_MODE_WIND_TUNNEL)) {
             return;
         }
 
         BeginBlendMode(BLEND_ALPHA_PREMULTIPLY);
         rlDisableDepthMask();
-        BeginShaderMode(system->particleShader);
         const bool smoothingView = (system->viewMode == VIEW_SMOOTHING_RADIUS);
         const float softPower = smoothingView ? 1.05f : 1.35f;
-        SetShaderValue(system->particleShader, system->particleShaderSoftPowerLoc, &softPower, SHADER_UNIFORM_FLOAT);
-        for (int i = 0; i < system->particleCount; ++i) {
-            const float strength = SliceHighlightStrength(system, i);
-            if (strength <= 0.0f) {
-                continue;
-            }
 
-            Color color = ParticleColor(system, i);
-            if (smoothingView) {
-                color.a = (unsigned char)ClampInt((int)lroundf(34.0f + 86.0f * strength), 28, 132);
-            } else {
-                color.a = (unsigned char)ClampInt((int)lroundf(92.0f + 128.0f * strength), 72, 220);
+        if (EnsureParticleInstanceRenderer((ParticleSystem3D *)system, system->particleCount)) {
+            int instanceCount = 0;
+            for (int i = 0; i < system->particleCount; ++i) {
+                const float strength = SliceHighlightStrength(system, i);
+                if (strength <= 0.0f) {
+                    continue;
+                }
+
+                Color color = ParticleColor(system, i);
+                if (smoothingView) {
+                    color.a = (unsigned char)ClampInt((int)lroundf(34.0f + 86.0f * strength), 28, 132);
+                } else {
+                    color.a = (unsigned char)ClampInt((int)lroundf(92.0f + 128.0f * strength), 72, 220);
+                }
+                const float diameter = smoothingView
+                    ? system->params.supportRadius * (1.12f + 0.30f * strength)
+                    : system->params.particleRadius * (2.90f + 0.85f * strength);
+                system->particleInstances[instanceCount++] = (ParticleRenderInstance){
+                    .x = system->x[i],
+                    .y = system->y[i],
+                    .z = system->z[i],
+                    .r = color.r,
+                    .g = color.g,
+                    .b = color.b,
+                    .a = color.a,
+                    .diameter = diameter,
+                };
             }
-            const float diameter = smoothingView
-                ? system->params.supportRadius * (1.12f + 0.30f * strength)
-                : system->params.particleRadius * (2.90f + 0.85f * strength);
-            DrawBillboardPro(camera, system->particleTexture, (Rectangle){0.0f, 0.0f, 1.0f, 1.0f},
-                (Vector3){system->x[i], system->y[i], system->z[i]},
-                camera.up, (Vector2){diameter, diameter}, (Vector2){diameter * 0.5f, diameter * 0.5f}, 0.0f, color);
+            DrawParticleInstanceBatch(system, camera, instanceCount, softPower);
+        } else {
+            BeginShaderMode(system->particleShader);
+            SetShaderValue(system->particleShader, system->particleShaderSoftPowerLoc, &softPower, SHADER_UNIFORM_FLOAT);
+            Vector3 billboardRight;
+            Vector3 billboardUp;
+            CameraBillboardBasis(camera, &billboardRight, &billboardUp);
+            rlSetTexture(system->particleTexture.id);
+            rlBegin(RL_QUADS);
+            for (int i = 0; i < system->particleCount; ++i) {
+                const float strength = SliceHighlightStrength(system, i);
+                if (strength <= 0.0f) {
+                    continue;
+                }
+
+                Color color = ParticleColor(system, i);
+                if (smoothingView) {
+                    color.a = (unsigned char)ClampInt((int)lroundf(34.0f + 86.0f * strength), 28, 132);
+                } else {
+                    color.a = (unsigned char)ClampInt((int)lroundf(92.0f + 128.0f * strength), 72, 220);
+                }
+                const float diameter = smoothingView
+                    ? system->params.supportRadius * (1.12f + 0.30f * strength)
+                    : system->params.particleRadius * (2.90f + 0.85f * strength);
+                DrawParticleBillboardQuad((Vector3){system->x[i], system->y[i], system->z[i]},
+                    billboardRight, billboardUp, diameter, color);
+            }
+            rlEnd();
+            rlSetTexture(0);
+            EndShaderMode();
         }
-        EndShaderMode();
+
         rlEnableDepthMask();
         EndBlendMode();
     }
@@ -7105,16 +7752,24 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
     static void DrawTank(const ParticleSystem3D *system)
     {
-        DrawCubeWiresV(system->boundsCenter, system->boundsSize, (Color){85, 128, 170, 255});
+        const float wirePad = fmaxf(system->params.particleRadius * 0.35f, 0.6f);
+        const Vector3 wireSize = {
+            system->boundsSize.x + wirePad * 2.0f,
+            system->boundsSize.y + wirePad * 2.0f,
+            system->boundsSize.z + wirePad * 2.0f,
+        };
+        rlDisableDepthMask();
+        DrawCubeWiresV(system->boundsCenter, wireSize, (Color){85, 128, 170, 255});
 
-        const Vector3 floor0 = {system->boundsMin.x, system->boundsMin.y, system->boundsMin.z};
-        const Vector3 floor1 = {system->boundsMax.x, system->boundsMin.y, system->boundsMin.z};
-        const Vector3 floor2 = {system->boundsMax.x, system->boundsMin.y, system->boundsMax.z};
-        const Vector3 floor3 = {system->boundsMin.x, system->boundsMin.y, system->boundsMax.z};
+        const Vector3 floor0 = {system->boundsMin.x - wirePad, system->boundsMin.y - wirePad, system->boundsMin.z - wirePad};
+        const Vector3 floor1 = {system->boundsMax.x + wirePad, system->boundsMin.y - wirePad, system->boundsMin.z - wirePad};
+        const Vector3 floor2 = {system->boundsMax.x + wirePad, system->boundsMin.y - wirePad, system->boundsMax.z + wirePad};
+        const Vector3 floor3 = {system->boundsMin.x - wirePad, system->boundsMin.y - wirePad, system->boundsMax.z + wirePad};
         DrawLine3D(floor0, floor1, (Color){42, 64, 88, 200});
         DrawLine3D(floor1, floor2, (Color){42, 64, 88, 200});
         DrawLine3D(floor2, floor3, (Color){42, 64, 88, 200});
         DrawLine3D(floor3, floor0, (Color){42, 64, 88, 200});
+        rlEnableDepthMask();
     }
 
     static void DrawHud(const ParticleSystem3D *system)
@@ -7150,6 +7805,18 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
     {
         const int waterCylinderCount = ClampInt(system->waterCylinderCount, 1, WATER_CYLINDER_MAX);
         const int waterCylinderSelected = ClampInt(system->waterCylinderSelected, 0, waterCylinderCount - 1);
+        const int bakeParticleTarget = ClampInt(bake->particleTarget, 1, BAKE_MAX_PARTICLE_COUNT);
+        const float acousticResolvedHz = system->acousticAudioLoaded
+            ? AcousticResolvedFrequencyEstimateForBakeTarget(system, bakeParticleTarget)
+            : AcousticResolvedFrequencyEstimate(system);
+        const float acousticSlowdown = system->acousticAudioLoaded
+            ? AcousticBakeSlowdownForTarget(system, bakeParticleTarget)
+            : AcousticAudioSlowdownFactor(system);
+        const float acousticRestoredHz = acousticResolvedHz * acousticSlowdown;
+        const float acousticSlowBakeDuration = system->acousticAudioLoaded
+            ? (system->acousticEnvelopeDuration * acousticSlowdown +
+                ACOUSTIC_AUDIO_PREROLL_SECONDS + ACOUSTIC_AUDIO_POSTROLL_SECONDS)
+            : bake->duration;
         Ui3DPanelState state = {
             .backend = (int)system->activeBackend,
             .targetParticleCount = (bake->status == BAKE_STATUS_BAKING || bake->hasCache)
@@ -7225,6 +7892,12 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
             .acousticAudioLoaded = system->acousticAudioLoaded,
             .acousticAudioLabel = system->acousticAudioLoaded ? system->acousticAudioLabel : "procedural",
             .acousticAudioDuration = system->acousticEnvelopeDuration,
+            .acousticResolvedHz = acousticResolvedHz,
+            .acousticDriverHz = system->acousticAudioLoaded ? system->acousticWaveformSampleRate : 0.0f,
+            .acousticPropagationDelay = AcousticSpeakerMicDelaySeconds(system),
+            .acousticSlowdownFactor = acousticSlowdown,
+            .acousticRestoredBandwidthHz = acousticRestoredHz,
+            .acousticSlowBakeDuration = acousticSlowBakeDuration,
             .bakeStatus = (int)bake->status,
             .bakeSimulationLocked = bake->status == BAKE_STATUS_BAKING,
             .bakeDuration = bake->duration,
@@ -7387,6 +8060,9 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         }
         if (actions->setColorMode) {
             system->colorMode = (ColorMode)actions->colorMode;
+            if (ColorModeNeedsVorticity(system->colorMode)) {
+                system->framesUntilVorticity = 0;
+            }
         }
         if (actions->setFlyCamera) {
             SetFlyCameraMode(orbit, camera, system, actions->flyCamera);
@@ -7480,6 +8156,10 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         if (actions->setAcousticDragScale) {
             system->acousticDragScale = ClampFloat(actions->acousticDragScale, 0.00f, 1.00f);
             refreshAcousticTuning = true;
+        }
+        if (actions->setAcousticSlowdownFactor) {
+            system->acousticAudioSlowdownFactor = ClampFloat(actions->acousticSlowdownFactor,
+                ACOUSTIC_AUDIO_MIN_SLOWDOWN_FACTOR, ACOUSTIC_AUDIO_MAX_SLOWDOWN_FACTOR);
         }
         if (actions->setSpeakerWidth) {
             system->speakerWidth = ClampFloat(actions->speakerWidth, 8.0f, 80.0f);
@@ -7619,7 +8299,6 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
 
     static void DrawWorld(const ParticleSystem3D *system, Camera3D camera)
     {
-        DrawTank(system);
         DrawObstacle(system);
         DrawAcousticRig(system);
         if (system->showParticles) {
@@ -7629,6 +8308,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         DrawSlicePanels(system);
         DrawStreamlines(system);
         DrawPathlines(system);
+        DrawTank(system);
     }
 
     static void Cleanup(ParticleSystem3D *system)
@@ -7636,6 +8316,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
         ShutdownAudioOutput(system);
         ShutdownGpuBackend(system);
         UnloadImportedObstacle(system);
+        UnloadParticleInstanceRenderer(system);
         if (system->particleTexture.id != 0) {
             UnloadTexture(system->particleTexture);
         }
@@ -7685,7 +8366,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
     int main(int argc, char **argv)
     {
         SetTraceLogLevel(LOG_WARNING);
-        SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
+        SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
         InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "FluidSim - 3D SPH");
         SetTargetFPS(144);
 
@@ -7761,6 +8442,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 panelActions.setSpeakerFrequency || panelActions.setSpeakerAmplitude ||
                 panelActions.setAcousticSoundSpeed || panelActions.setAcousticMachLimit ||
                 panelActions.setAcousticViscosityScale || panelActions.setAcousticDragScale ||
+                panelActions.setAcousticSlowdownFactor ||
                 panelActions.requestLoadAcousticAudio ||
                 panelActions.setSpeakerWidth || panelActions.setSpeakerHeight || panelActions.setSpeakerDepth ||
                 panelActions.setMicRadius || panelActions.requestReset;
@@ -7788,7 +8470,7 @@ static Matrix ImportedObstacleRotationMatrix(const ParticleSystem3D *system)
                 (void)BakeLoadLatest(&system, &bake);
             }
             if (panelActions.requestBakeExportMic) {
-                (void)BakeExportMicWav(&bake);
+                (void)BakeExportMicWav(&system, &bake);
             }
             if (panelActions.requestBakeStart) {
                 BakeStart(&system, &bake);

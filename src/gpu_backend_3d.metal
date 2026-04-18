@@ -793,12 +793,19 @@ inline void resolveObstacle(constant GpuSimParams3D &params,
         return;
     }
 
-    float surfaceOffset = params.particleRadius *
-        ((sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f);
+    bool bakeObstacleQuality = sceneIsWindTunnel(params) && params.particleCount > 120000u;
+    float surfaceOffsetScale = (sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 1.20f : 0.70f;
+    if (bakeObstacleQuality) {
+        surfaceOffsetScale = (params.obstacleModel == OBSTACLE_IMPORTED) ? 0.52f : min(surfaceOffsetScale, 0.62f);
+    }
+    float surfaceOffset = params.particleRadius * surfaceOffsetScale;
     float3 normal = float3(1.0f, 0.0f, 0.0f);
     bool resolved = false;
 
     uint maxIterations = (sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 4u : 2u;
+    if (bakeObstacleQuality) {
+        maxIterations = (params.obstacleModel == OBSTACLE_IMPORTED) ? 5u : max(maxIterations, 3u);
+    }
     for (uint iteration = 0u; iteration < maxIterations; ++iteration) {
         float signedDistance = solidObstacleSignedDistance(params, importedSdf, x, y, z);
         if (signedDistance >= surfaceOffset) {
@@ -807,7 +814,8 @@ inline void resolveObstacle(constant GpuSimParams3D &params,
 
         normal = solidObstacleNormal(params, importedSdf, x, y, z);
         float pushOut = (surfaceOffset - signedDistance) +
-            params.particleRadius * ((sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f);
+            params.particleRadius * (bakeObstacleQuality ? 0.14f :
+                ((sceneIsWindTunnel(params) && params.obstacleModel == OBSTACLE_CAR) ? 0.18f : 0.08f));
         x += normal.x * pushOut;
         y += normal.y * pushOut;
         z += normal.z * pushOut;

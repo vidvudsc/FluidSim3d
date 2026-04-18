@@ -106,6 +106,12 @@ typedef struct Ui3DPanelState {
     bool acousticAudioLoaded;
     const char *acousticAudioLabel;
     float acousticAudioDuration;
+    float acousticResolvedHz;
+    float acousticDriverHz;
+    float acousticPropagationDelay;
+    float acousticSlowdownFactor;
+    float acousticRestoredBandwidthHz;
+    float acousticSlowBakeDuration;
     int bakeStatus;
     bool bakeSimulationLocked;
     float bakeDuration;
@@ -232,6 +238,8 @@ typedef struct Ui3DPanelActions {
     float acousticViscosityScale;
     bool setAcousticDragScale;
     float acousticDragScale;
+    bool setAcousticSlowdownFactor;
+    float acousticSlowdownFactor;
     bool setAudioMonitorPitchHz;
     float audioMonitorPitchHz;
     bool setSpeakerWidth;

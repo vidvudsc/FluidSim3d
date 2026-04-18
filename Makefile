@@ -28,7 +28,7 @@ CFLAGS := -std=c11 -x objective-c -fobjc-arc -O3 -ffast-math -fblocks -Wall -Wex
 MMFLAGS := -std=c++17 -x objective-c++ -fobjc-arc -O3 -ffast-math -fblocks -Wall -Wextra -Wpedantic $(INCLUDES)
 THIRD_PARTY_CXXFLAGS := -std=c++17 -O3 -ffast-math -fblocks $(INCLUDES)
 CFLAGS_3D := $(CFLAGS)
-LDFLAGS := $(RAYLIB_LIBS) -lm -framework Foundation -framework AppKit -framework Metal
+LDFLAGS := $(RAYLIB_LIBS) -lm -framework Foundation -framework AppKit -framework Metal -framework OpenGL
 
 .PHONY: all run run3d clean
 
