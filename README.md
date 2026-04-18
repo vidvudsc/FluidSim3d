@@ -6,27 +6,25 @@ FluidSim 3D is a macOS Raylib + Metal particle simulator with water tank, gas ta
 
 ### Water mode
 
-![Water tank](docs/images/water.png)
+<img src="docs/images/water.png" width="100%">
 
-![Water bake — 1M particles](docs/images/bake-water.png)
-
-![Water bake playback](docs/images/water-bake.gif)
+<img src="docs/images/water-bake.gif" width="100%">
 
 ### Gas mode
 
-![Gas interaction](docs/images/gas-interaction.gif)
+<img src="docs/images/gas-interaction.gif" width="100%">
 
-![Bake pressure view](docs/images/bake-pressure.png)
+<img src="docs/images/speaker.gif" width="100%">
 
-![Audio-driven gas bake](docs/images/speaker.gif)
-
-![Acoustics / mic](docs/images/mic.png)
+<img src="docs/images/mic.png" width="100%">
 
 ### Wind tunnel mode
 
-![Imported model — wind tunnel](docs/images/plane.png)
+<img src="docs/images/plane.png" width="100%">
 
-![Wind tunnel fly-through](docs/images/plane.gif)
+<img src="docs/images/plane.gif" width="100%">
+
+<img src="docs/images/bake-pressure.png" width="100%">
 
 ## How It Works
 
